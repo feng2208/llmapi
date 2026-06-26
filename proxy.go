@@ -60,7 +60,7 @@ func writeErrorJSON(w http.ResponseWriter, statusCode int, message string) {
 		},
 	}
 
-	json.NewEncoder(w).Encode(errResp)
+	writeJSONNoEscape(w, errResp)
 }
 
 func NewProxyRouter(cfg *Config, keyManagers map[string]*KeyManager, debug bool) *ProxyRouter {
@@ -111,7 +111,14 @@ func extractBearerToken(r *http.Request) string {
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		return strings.TrimSpace(authHeader[7:])
 	}
-	return authHeader
+	if authHeader != "" {
+		return authHeader
+	}
+	// Fallback: Claude SDK uses x-api-key header
+	if apiKey := r.Header.Get("x-api-key"); apiKey != "" {
+		return apiKey
+	}
+	return ""
 }
 
 // authenticate verifies the token and checks client rate limit.
@@ -133,8 +140,8 @@ func (pr *ProxyRouter) authenticate(r *http.Request) (int, string) {
 	return 0, ""
 }
 
-// parseRequestBody reads and parses the JSON request body.
-func (pr *ProxyRouter) parseRequestBody(r *http.Request) (map[string]interface{}, error) {
+// readRequestBody reads the raw request body with size limit and debug logging.
+func (pr *ProxyRouter) readRequestBody(r *http.Request, label string) ([]byte, error) {
 	r.Body = http.MaxBytesReader(nil, r.Body, pr.cfg.MaxBodySize)
 
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -143,11 +150,21 @@ func (pr *ProxyRouter) parseRequestBody(r *http.Request) (map[string]interface{}
 	}
 
 	if pr.debug {
-		log.Printf("[DEBUG] Client Request: %s %s", r.Method, r.URL.Path)
+		log.Printf("[DEBUG] Client Request (%s): %s %s", label, r.Method, r.URL.Path)
 		for k, v := range r.Header {
 			log.Printf("[DEBUG] Client Header: %s: %s", k, strings.Join(v, ", "))
 		}
-		log.Printf("[DEBUG] Client Body: %s", truncateString(string(bodyBytes), 16384))
+		log.Printf("[DEBUG] Client Body: %s", string(bodyBytes))
+	}
+
+	return bodyBytes, nil
+}
+
+// parseRequestBody reads and parses the JSON request body.
+func (pr *ProxyRouter) parseRequestBody(r *http.Request) (map[string]interface{}, error) {
+	bodyBytes, err := pr.readRequestBody(r, "OpenAI")
+	if err != nil {
+		return nil, err
 	}
 
 	var body map[string]interface{}
@@ -203,7 +220,7 @@ func (pr *ProxyRouter) rewriteBody(body map[string]interface{}, pConfig ModelPro
 		body["reasoning_effort"] = pConfig.ReasoningEffort
 	}
 
-	newBodyBytes, err := json.Marshal(body)
+	newBodyBytes, err := marshalNoEscape(body)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +243,57 @@ func (rw *responseWriterRecorder) Flush() {
 	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func writeClaudeErrorJSON(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	errResp := map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    "invalid_request_error",
+			"message": message,
+		},
+	}
+
+	writeJSONNoEscape(w, errResp)
+}
+
+func writeError(w http.ResponseWriter, requestType string, statusCode int, message string) {
+	if requestType == "claude" {
+		writeClaudeErrorJSON(w, statusCode, message)
+	} else {
+		writeErrorJSON(w, statusCode, message)
+	}
+}
+
+func (pr *ProxyRouter) parseClaudeRequest(r *http.Request) (map[string]interface{}, error) {
+	bodyBytes, err := pr.readRequestBody(r, "Claude")
+	if err != nil {
+		return nil, err
+	}
+
+	var claudeReq ClaudeMessagesRequest
+	if err := json.Unmarshal(bodyBytes, &claudeReq); err != nil {
+		return nil, fmt.Errorf("invalid Claude JSON body: %w", err)
+	}
+
+	return TranslateClaudeRequestToOpenAI(&claudeReq)
+}
+
+func (pr *ProxyRouter) parseResponsesRequest(r *http.Request) (map[string]interface{}, error) {
+	bodyBytes, err := pr.readRequestBody(r, "Responses")
+	if err != nil {
+		return nil, err
+	}
+
+	var responsesReq OpenAIResponsesRequest
+	if err := json.Unmarshal(bodyBytes, &responsesReq); err != nil {
+		return nil, fmt.Errorf("invalid Responses JSON body: %w", err)
+	}
+
+	return TranslateResponsesRequestToOpenAI(&responsesReq)
 }
 
 func (pr *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -257,33 +325,51 @@ func (pr *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pathWithoutPrefix != "/chat/completions" {
+	if pathWithoutPrefix != "/chat/completions" && pathWithoutPrefix != "/messages" && pathWithoutPrefix != "/responses" {
 		writeErrorJSON(w, http.StatusNotFound, "Not Found")
 		return
 	}
 
+	var requestType string
+	if pathWithoutPrefix == "/messages" {
+		requestType = "claude"
+	} else if pathWithoutPrefix == "/responses" {
+		requestType = "responses"
+	} else {
+		requestType = "openai"
+	}
+
 	// 1. Authenticate and rate limit client
 	if errCode, errMsg := pr.authenticate(r); errMsg != "" {
-		writeErrorJSON(w, errCode, errMsg)
+		writeError(w, requestType, errCode, errMsg)
 		return
 	}
 
 	// 2. Parse request body
-	bodyMap, err := pr.parseRequestBody(r)
+	var bodyMap map[string]interface{}
+	var err error
+	if requestType == "claude" {
+		bodyMap, err = pr.parseClaudeRequest(r)
+	} else if requestType == "responses" {
+		bodyMap, err = pr.parseResponsesRequest(r)
+	} else {
+		bodyMap, err = pr.parseRequestBody(r)
+	}
+
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		writeError(w, requestType, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// 3. Extract and validate model
 	modelInterface, ok := bodyMap["model"]
 	if !ok {
-		writeErrorJSON(w, http.StatusBadRequest, "Missing model field")
+		writeError(w, requestType, http.StatusBadRequest, "Missing model field")
 		return
 	}
 	modelID, ok := modelInterface.(string)
 	if !ok {
-		writeErrorJSON(w, http.StatusBadRequest, "Model field must be a string")
+		writeError(w, requestType, http.StatusBadRequest, "Model field must be a string")
 		return
 	}
 
@@ -291,19 +377,19 @@ func (pr *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handler, key, keyIndex, err := pr.selectProvider(modelID)
 	if err != nil {
 		log.Printf("provider selection failed for model=%s: %v", modelID, err)
-		writeErrorJSON(w, http.StatusServiceUnavailable, "Service Unavailable: "+err.Error())
+		writeError(w, requestType, http.StatusServiceUnavailable, "Service Unavailable: "+err.Error())
 		return
 	}
 
 	// 5. Rewrite body
 	newBodyBytes, err := pr.rewriteBody(bodyMap, handler.config)
 	if err != nil {
-		writeErrorJSON(w, http.StatusInternalServerError, "Failed to rewrite body")
+		writeError(w, requestType, http.StatusInternalServerError, "Failed to rewrite body")
 		return
 	}
 
 	// 6. Forward request
-	handler.forwardRequest(w, r, newBodyBytes, key, keyIndex, pr.debug)
+	handler.forwardRequest(w, r, newBodyBytes, key, keyIndex, pr.debug, requestType)
 }
 
 func (pr *ProxyRouter) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -327,13 +413,12 @@ func (pr *ProxyRouter) handleModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	writeJSONNoEscape(w, resp)
 }
 
-func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request, bodyBytes []byte, key string, keyIndex int, debug bool) {
-	log.Printf("using provider=%s key[%d] for request", ph.config.Name, keyIndex)
+func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request, bodyBytes []byte, key string, keyIndex int, debug bool, requestType string) {
+	log.Printf("using provider=%s model=%s key[%d] for request", ph.config.Name, ph.config.Model, keyIndex)
 
 	ctx, cancel := context.WithTimeout(r.Context(), ph.config.Timeout)
 	defer cancel()
@@ -341,7 +426,7 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 	req, err := http.NewRequestWithContext(ctx, r.Method, ph.config.Upstream, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("failed to create upstream request: %v", err)
-		writeErrorJSON(w, http.StatusInternalServerError, "Internal Server Error")
+		writeError(w, requestType, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
@@ -349,6 +434,13 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
+
+	// Clean up protocol-specific headers that would confuse the upstream OpenAI-compatible server
+	if requestType == "claude" {
+		req.Header.Del("anthropic-version")
+		req.Header.Del("anthropic-beta")
+		req.Header.Del("x-api-key")
+	}
 
 	if debug {
 		log.Printf("[DEBUG] Upstream Request: %s %s", req.Method, req.URL.String())
@@ -360,13 +452,13 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 				log.Printf("[DEBUG] Upstream Header: %s: %s", k, strings.Join(v, ", "))
 			}
 		}
-		log.Printf("[DEBUG] Upstream Body: %s", truncateString(string(bodyBytes), 16384))
+		log.Printf("[DEBUG] Upstream Body: %s", string(bodyBytes))
 	}
 
 	resp, err := ph.client.Do(req)
 	if err != nil {
 		log.Printf("upstream request failed: %v", err)
-		writeErrorJSON(w, http.StatusBadGateway, "Bad Gateway: "+err.Error())
+		writeError(w, requestType, http.StatusBadGateway, "Bad Gateway: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -387,5 +479,89 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 		ph.keyManager.ResetFailures(keyIndex)
 	}
 
-	streamResponse(w, resp, debug)
+	// For adapter request types (claude/responses), translate 4xx errors to their native format.
+	// For openai passthrough, let streamResponse handle it to preserve all upstream headers.
+	if resp.StatusCode >= 400 && requestType != "openai" {
+		body, _ := io.ReadAll(resp.Body)
+		if debug {
+			log.Printf("[DEBUG] Upstream Error Body: %s", string(body))
+		}
+		var errMap map[string]interface{}
+		if json.Unmarshal(body, &errMap) == nil {
+			if errMsgObj, ok := errMap["error"].(map[string]interface{}); ok {
+				if msg, ok := errMsgObj["message"].(string); ok {
+					writeError(w, requestType, resp.StatusCode, msg)
+					return
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	if requestType == "claude" {
+		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(resp.StatusCode)
+			if err := TranslateOpenAIStreamToClaude(resp.Body, w, debug); err != nil {
+				log.Printf("failed to translate stream to Claude: %v", err)
+			}
+		} else {
+			translateAndWriteJSON(w, resp, debug, requestType, func(openaiResp map[string]interface{}) (interface{}, error) {
+				return TranslateOpenAIResponseToClaude(openaiResp)
+			})
+		}
+	} else if requestType == "responses" {
+		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(resp.StatusCode)
+			if err := TranslateOpenAIStreamToResponses(resp.Body, w, debug); err != nil {
+				log.Printf("failed to translate stream to Responses: %v", err)
+			}
+		} else {
+			translateAndWriteJSON(w, resp, debug, requestType, func(openaiResp map[string]interface{}) (interface{}, error) {
+				return TranslateOpenAIResponseToResponses(openaiResp)
+			})
+		}
+	} else {
+		streamResponse(w, resp, debug)
+	}
+}
+
+// translateAndWriteJSON reads the upstream JSON response, translates it, and writes it to the client.
+func translateAndWriteJSON(w http.ResponseWriter, resp *http.Response, debug bool, requestType string, translator func(map[string]interface{}) (interface{}, error)) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeError(w, requestType, http.StatusInternalServerError, "failed to read upstream response")
+		return
+	}
+
+	if debug {
+		log.Printf("[DEBUG] Upstream Response Body: %s", string(body))
+	}
+
+	var openaiResp map[string]interface{}
+	if err := json.Unmarshal(body, &openaiResp); err != nil {
+		writeError(w, requestType, http.StatusInternalServerError, "failed to parse upstream response JSON")
+		return
+	}
+
+	translated, err := translator(openaiResp)
+	if err != nil {
+		writeError(w, requestType, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+
+	if debug {
+		if translatedBytes, err := marshalNoEscape(translated); err == nil {
+			log.Printf("[DEBUG] Translated Response Body: %s", string(translatedBytes))
+		}
+	}
+
+	writeJSONNoEscape(w, translated)
 }

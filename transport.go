@@ -97,6 +97,6 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, debug bool) {
 	}
 
 	if debug {
-		log.Printf("[DEBUG] Upstream Response Body: %s", truncateString(string(debugBody), 16384))
+		log.Printf("[DEBUG] Upstream Response Body: %s", string(debugBody))
 	}
 }
