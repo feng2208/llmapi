@@ -200,6 +200,71 @@ func (pr *ProxyRouter) selectProvider(modelID string) (*ProviderHandler, string,
 func (pr *ProxyRouter) rewriteBody(body map[string]interface{}, pConfig ModelProviderConfig) ([]byte, error) {
 	body["model"] = pConfig.Model
 
+	// Google Gemini requires a thought_signature for tool calling to work.
+	// Standard clients (like LangChain, Dify, etc.) don't keep/echo non-standard fields like thought_signature
+	// in the history, which leads to "Function call is missing a thought_signature" errors.
+	// We automatically patch missing thought signatures with skip_thought_signature_validator.
+	if pConfig.Name == "gemini" || strings.Contains(strings.ToLower(pConfig.Name), "gemini") || strings.Contains(strings.ToLower(pConfig.Upstream), "googleapis.com") {
+		if msgs, ok := body["messages"].([]interface{}); ok {
+			for _, msgVal := range msgs {
+				msg, ok := msgVal.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				role := fmt.Sprintf("%v", msg["role"])
+				if role == "assistant" {
+					if toolCalls, ok := msg["tool_calls"].([]interface{}); ok {
+						for _, tcVal := range toolCalls {
+							tc, ok := tcVal.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							hasSig := false
+							if ecVal, ok := tc["extra_content"]; ok {
+								if ec, ok := ecVal.(map[string]interface{}); ok {
+									if gVal, ok := ec["google"]; ok {
+										if g, ok := gVal.(map[string]interface{}); ok {
+											if sig, ok := g["thought_signature"]; ok && sig != "" {
+												hasSig = true
+											}
+											if sig, ok := g["thoughtSignature"]; ok && sig != "" {
+												hasSig = true
+											}
+										}
+									}
+								}
+							}
+							if !hasSig {
+								var ec map[string]interface{}
+								if ecVal, ok := tc["extra_content"]; ok {
+									if e, ok := ecVal.(map[string]interface{}); ok {
+										ec = e
+									}
+								}
+								if ec == nil {
+									ec = make(map[string]interface{})
+									tc["extra_content"] = ec
+								}
+								var g map[string]interface{}
+								if gVal, ok := ec["google"]; ok {
+									if gg, ok := gVal.(map[string]interface{}); ok {
+										g = gg
+									}
+								}
+								if g == nil {
+									g = make(map[string]interface{})
+									ec["google"] = g
+								}
+								g["thought_signature"] = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
+								g["thoughtSignature"] = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if pConfig.IncludeThoughts {
 		delete(body, "reasoning_effort")
 

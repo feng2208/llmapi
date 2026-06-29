@@ -96,9 +96,10 @@ type OpenAIOutputMessage struct {
 }
 
 type OpenAIPart struct {
-	Type     string              `json:"type"`
-	Text     string              `json:"text,omitempty"`
-	Function *OpenAIPartFunction `json:"function_call,omitempty"`
+	Type         string              `json:"type"`
+	Text         string              `json:"text,omitempty"`
+	Function     *OpenAIPartFunction `json:"function_call,omitempty"`
+	ExtraContent interface{}         `json:"extra_content,omitempty"`
 }
 
 type OpenAIPartFunction struct {
@@ -485,17 +486,21 @@ func TranslateResponsesRequestToOpenAI(req *OpenAIResponsesRequest) (map[string]
 								argsStr = marshalJSONString(av)
 							}
 						}
+						tcObj := map[string]interface{}{
+							"id":   elMap["call_id"],
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":      elMap["name"],
+								"arguments": argsStr,
+							},
+						}
+						if ec, exists := elMap["extra_content"]; exists && ec != nil {
+							tcObj["extra_content"] = ec
+						}
 						openAIMessages = append(openAIMessages, map[string]interface{}{
 							"role": "assistant",
 							"tool_calls": []interface{}{
-								map[string]interface{}{
-									"id":   elMap["call_id"],
-									"type": "function",
-									"function": map[string]interface{}{
-										"name":      elMap["name"],
-										"arguments": argsStr,
-									},
-								},
+								tcObj,
 							},
 						})
 						continue
@@ -683,14 +688,18 @@ func TranslateOpenAIResponseToResponses(openaiResp map[string]interface{}) (*Ope
 			fnName := fmt.Sprintf("%v", fn["name"])
 			fnArgsStr := fmt.Sprintf("%v", fn["arguments"])
 
-			outputParts = append(outputParts, OpenAIPart{
+			part := OpenAIPart{
 				Type: "function_call",
 				Function: &OpenAIPartFunction{
 					CallID:    tcID,
 					Name:      fnName,
 					Arguments: fnArgsStr,
 				},
-			})
+			}
+			if ec, exists := tc["extra_content"]; exists {
+				part.ExtraContent = ec
+			}
+			outputParts = append(outputParts, part)
 		}
 	}
 
@@ -744,13 +753,14 @@ type OpenAIMessageChunk struct {
 		Delta struct {
 			Content   string `json:"content"`
 			ToolCalls []struct {
-				Index    int    `json:"index"`
-				ID       string `json:"id"`
-				Type     string `json:"type"`
-				Function struct {
+				Index        int    `json:"index"`
+				ID           string `json:"id"`
+				Type         string `json:"type"`
+				Function     struct {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
 				} `json:"function"`
+				ExtraContent interface{} `json:"extra_content,omitempty"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
@@ -1016,12 +1026,13 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 }
 
 type responsesToolCallState struct {
-	id          string
-	name        string
-	arguments   strings.Builder
-	outputIndex int
-	itemAdded   bool
-	done        bool
+	id           string
+	name         string
+	arguments    strings.Builder
+	outputIndex  int
+	itemAdded    bool
+	done         bool
+	extraContent interface{}
 }
 
 type responsesStreamState struct {
@@ -1129,15 +1140,16 @@ func (s *responsesStreamState) ensureContentPart(w io.Writer) error {
 	return nil
 }
 
-func (s *responsesStreamState) ensureToolCallItem(w io.Writer, tcIndex int, tcID, tcName string) (*responsesToolCallState, error) {
+func (s *responsesStreamState) ensureToolCallItem(w io.Writer, tcIndex int, tcID, tcName string, extraContent interface{}) (*responsesToolCallState, error) {
 	if s.activeToolCalls == nil {
 		s.activeToolCalls = make(map[int]*responsesToolCallState)
 	}
 	state, ok := s.activeToolCalls[tcIndex]
 	if !ok {
 		state = &responsesToolCallState{
-			id:          tcID,
-			outputIndex: s.toolOutputIndex(tcIndex),
+			id:           tcID,
+			outputIndex:  s.toolOutputIndex(tcIndex),
+			extraContent: extraContent,
 		}
 		s.activeToolCalls[tcIndex] = state
 	}
@@ -1147,19 +1159,26 @@ func (s *responsesStreamState) ensureToolCallItem(w io.Writer, tcIndex int, tcID
 	if tcName != "" {
 		state.name = tcName
 	}
+	if extraContent != nil {
+		state.extraContent = extraContent
+	}
 	if state.itemAdded || state.id == "" {
 		return state, nil
 	}
+	item := map[string]interface{}{
+		"type":      "function_call",
+		"id":        state.id,
+		"call_id":   state.id,
+		"name":      state.name,
+		"arguments": "",
+		"status":    "in_progress",
+	}
+	if state.extraContent != nil {
+		item["extra_content"] = state.extraContent
+	}
 	if err := s.emit(w, "response.output_item.added", map[string]interface{}{
 		"output_index": state.outputIndex,
-		"item": map[string]interface{}{
-			"type":      "function_call",
-			"id":        state.id,
-			"call_id":   state.id,
-			"name":      state.name,
-			"arguments": "",
-			"status":    "in_progress",
-		},
+		"item":         item,
 	}); err != nil {
 		return nil, err
 	}
@@ -1215,16 +1234,20 @@ func (s *responsesStreamState) finalizeToolCalls(w io.Writer) error {
 		}); err != nil {
 			return err
 		}
+		item := map[string]interface{}{
+			"type":      "function_call",
+			"id":        state.id,
+			"call_id":   state.id,
+			"name":      state.name,
+			"arguments": args,
+			"status":    "completed",
+		}
+		if state.extraContent != nil {
+			item["extra_content"] = state.extraContent
+		}
 		if err := s.emit(w, "response.output_item.done", map[string]interface{}{
 			"output_index": state.outputIndex,
-			"item": map[string]interface{}{
-				"type":      "function_call",
-				"id":        state.id,
-				"call_id":   state.id,
-				"name":      state.name,
-				"arguments": args,
-				"status":    "completed",
-			},
+			"item":         item,
 		}); err != nil {
 			return err
 		}
@@ -1254,14 +1277,18 @@ func (s *responsesStreamState) buildCompletedOutput() []interface{} {
 		if !state.itemAdded {
 			continue
 		}
-		output = append(output, map[string]interface{}{
+		item := map[string]interface{}{
 			"type":      "function_call",
 			"id":        state.id,
 			"call_id":   state.id,
 			"name":      state.name,
 			"arguments": state.arguments.String(),
 			"status":    "completed",
-		})
+		}
+		if state.extraContent != nil {
+			item["extra_content"] = state.extraContent
+		}
+		output = append(output, item)
 	}
 	return output
 }
@@ -1350,7 +1377,7 @@ func TranslateOpenAIStreamToResponses(r io.Reader, w io.Writer, debug bool) erro
 			if err := state.ensureCreated(targetWriter); err != nil {
 				return err
 			}
-			toolState, err := state.ensureToolCallItem(targetWriter, tc.Index, tc.ID, tc.Function.Name)
+			toolState, err := state.ensureToolCallItem(targetWriter, tc.Index, tc.ID, tc.Function.Name, tc.ExtraContent)
 			if err != nil {
 				return err
 			}

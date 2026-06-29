@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
 func TestTranslateClaudeRequestToOpenAI(t *testing.T) {
 	req := &ClaudeMessagesRequest{
-		Model: "gemini-flash-lite",
+		Model:  "gemini-flash-lite",
 		System: "You are a helpful assistant.",
 		Messages: []ClaudeMessage{
 			{
@@ -262,9 +263,9 @@ func TestTranslateResponsesRequestToOpenAIFunctionCallOutput(t *testing.T) {
 		Model: "gemini-flash-lite",
 		Input: []interface{}{
 			map[string]interface{}{
-				"type": "function_call_output",
+				"type":    "function_call_output",
 				"call_id": "call_abc",
-				"output": "Beijing is sunny",
+				"output":  "Beijing is sunny",
 			},
 		},
 	}
@@ -552,9 +553,9 @@ func TestTranslateResponsesRequestToOpenAIFunctionCall(t *testing.T) {
 		Model: "gemini-flash-lite",
 		Input: []interface{}{
 			map[string]interface{}{
-				"type": "function_call",
-				"call_id": "call_abc",
-				"name": "get_weather",
+				"type":      "function_call",
+				"call_id":   "call_abc",
+				"name":      "get_weather",
 				"arguments": `{"location":"Beijing"}`,
 			},
 		},
@@ -582,6 +583,175 @@ func TestTranslateResponsesRequestToOpenAIFunctionCall(t *testing.T) {
 	fn := tc["function"].(map[string]interface{})
 	if fn["name"] != "get_weather" || fn["arguments"] != `{"location":"Beijing"}` {
 		t.Errorf("invalid function call details: %v", fn)
+	}
+}
+
+func TestTranslateResponsesRequestToOpenAIFunctionCallWithExtraContent(t *testing.T) {
+	req := &OpenAIResponsesRequest{
+		Model: "gemini-flash-lite",
+		Input: []interface{}{
+			map[string]interface{}{
+				"type":      "function_call",
+				"call_id":   "call_abc",
+				"name":      "get_weather",
+				"arguments": `{"location":"Beijing"}`,
+				"extra_content": map[string]interface{}{
+					"google": map[string]interface{}{
+						"thought_signature": "sig_123",
+					},
+				},
+			},
+		},
+	}
+	openaiReq, err := TranslateResponsesRequestToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	msgs := openaiReq["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	m := msgs[0].(map[string]interface{})
+	toolCalls, ok := m["tool_calls"].([]interface{})
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %v", m["tool_calls"])
+	}
+	tc := toolCalls[0].(map[string]interface{})
+	ec, ok := tc["extra_content"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing or invalid extra_content in tool call: %v", tc)
+	}
+	google := ec["google"].(map[string]interface{})
+	if google["thought_signature"] != "sig_123" {
+		t.Errorf("expected thought_signature sig_123, got %v", google["thought_signature"])
+	}
+}
+
+func TestTranslateOpenAIResponseToResponsesWithExtraContent(t *testing.T) {
+	openaiResp := map[string]interface{}{
+		"id": "chatcmpl-123",
+		"choices": []interface{}{
+			map[string]interface{}{
+				"message": map[string]interface{}{
+					"role": "assistant",
+					"tool_calls": []interface{}{
+						map[string]interface{}{
+							"id":   "call_abc",
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":      "get_weather",
+								"arguments": `{"location":"Beijing"}`,
+							},
+							"extra_content": map[string]interface{}{
+								"google": map[string]interface{}{
+									"thought_signature": "sig_123",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	resp, err := TranslateOpenAIResponseToResponses(openaiResp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Output) != 1 {
+		t.Fatalf("expected 1 output message, got %d", len(resp.Output))
+	}
+	m := resp.Output[0]
+	if len(m.Content) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(m.Content))
+	}
+	part := m.Content[0]
+	if part.Type != "function_call" {
+		t.Errorf("expected type function_call, got %s", part.Type)
+	}
+	ec, ok := part.ExtraContent.(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing or invalid extra_content in part: %v", part)
+	}
+	google := ec["google"].(map[string]interface{})
+	if google["thought_signature"] != "sig_123" {
+		t.Errorf("expected thought_signature sig_123, got %v", google["thought_signature"])
+	}
+}
+
+func TestTranslateOpenAIStreamToResponsesWithExtraContent(t *testing.T) {
+	streamInput := `data: {"id":"resp-456","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""},"extra_content":{"google":{"thought_signature":"sig_123"}}}]},"finish_reason":null}]}
+data: {"id":"resp-456","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+data: [DONE]
+`
+	var outputBuf bytes.Buffer
+	err := TranslateOpenAIStreamToResponses(strings.NewReader(streamInput), &outputBuf, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	outputStr := outputBuf.String()
+	if !strings.Contains(outputStr, `"thought_signature":"sig_123"`) {
+		t.Errorf("missing thought_signature in SSE events: %s", outputStr)
+	}
+}
+
+func TestRewriteBodyGeminiThoughtSignatureInjection(t *testing.T) {
+	pr := &ProxyRouter{}
+	body := map[string]interface{}{
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role":    "user",
+				"content": "Hello",
+			},
+			map[string]interface{}{
+				"role": "assistant",
+				"tool_calls": []interface{}{
+					map[string]interface{}{
+						"id":   "call_123",
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      "test_tool",
+							"arguments": "{}",
+						},
+					},
+				},
+			},
+		},
+	}
+	pConfig := ModelProviderConfig{
+		Name:     "gemini",
+		Model:    "gemini-2.5-flash",
+		Upstream: "https://generativelanguage.googleapis.com",
+	}
+
+	newBytes, err := pr.rewriteBody(body, pConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var newBody map[string]interface{}
+	if err := json.Unmarshal(newBytes, &newBody); err != nil {
+		t.Fatalf("failed to unmarshal rewritten body: %v", err)
+	}
+
+	msgs := newBody["messages"].([]interface{})
+	assistantMsg := msgs[1].(map[string]interface{})
+	toolCalls := assistantMsg["tool_calls"].([]interface{})
+	tc := toolCalls[0].(map[string]interface{})
+
+	ec, ok := tc["extra_content"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("extra_content missing or not a map: %v", tc)
+	}
+	google, ok := ec["google"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("google missing or not a map: %v", ec)
+	}
+	if google["thought_signature"] != "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=" {
+		t.Errorf("expected thought_signature skip sentinel, got %v", google["thought_signature"])
+	}
+	if google["thoughtSignature"] != "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=" {
+		t.Errorf("expected thoughtSignature skip sentinel, got %v", google["thoughtSignature"])
 	}
 }
 
