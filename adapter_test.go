@@ -148,14 +148,17 @@ func TestTranslateOpenAIResponseToClaude(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if claudeResp.ID != "chatcmpl-123" {
-		t.Errorf("expected ID chatcmpl-123, got %v", claudeResp.ID)
+	if claudeResp.ID != "msg_chatcmpl-123" {
+		t.Errorf("expected ID msg_chatcmpl-123, got %v", claudeResp.ID)
 	}
 	if claudeResp.Model != "gemini-2.5-flash-lite" {
 		t.Errorf("expected model, got %v", claudeResp.Model)
 	}
-	if claudeResp.StopReason != "tool_use" {
+	if claudeResp.StopReason == nil || *claudeResp.StopReason != "tool_use" {
 		t.Errorf("expected stop_reason tool_use, got %v", claudeResp.StopReason)
+	}
+	if claudeResp.StopSequence != nil {
+		t.Errorf("expected stop_sequence nil, got %v", claudeResp.StopSequence)
 	}
 	if len(claudeResp.Content) != 2 {
 		t.Fatalf("expected 2 content blocks, got %d", len(claudeResp.Content))
@@ -177,6 +180,19 @@ func TestTranslateOpenAIResponseToClaude(t *testing.T) {
 
 	if claudeResp.Usage.InputTokens != 15 || claudeResp.Usage.OutputTokens != 20 {
 		t.Errorf("invalid usage: %v", claudeResp.Usage)
+	}
+
+	// Verify JSON serialization includes stop_sequence as null
+	jsonBytes, err := json.Marshal(claudeResp)
+	if err != nil {
+		t.Fatalf("failed to marshal response: %v", err)
+	}
+	jsonStr := string(jsonBytes)
+	if !strings.Contains(jsonStr, `"stop_sequence":null`) {
+		t.Errorf("expected stop_sequence:null in JSON, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason in JSON, got: %s", jsonStr)
 	}
 }
 
@@ -217,6 +233,39 @@ data: [DONE]
 	}
 	if !strings.Contains(outputStr, "call_abc") || !strings.Contains(outputStr, "get_weather") {
 		t.Errorf("missing tool call details in output:\n%s", outputStr)
+	}
+	if !strings.Contains(outputStr, `"stop_sequence":null`) {
+		t.Errorf("missing stop_sequence:null in message_start event:\n%s", outputStr)
+	}
+}
+
+func TestTranslateOpenAIStreamToClaude_ToolCallOnly(t *testing.T) {
+	// Tool call without any preceding text content
+	streamInput := `data: {"id":"chatcmpl-456","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_xyz","type":"function","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-456","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"hello\"}"}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-456","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+`
+	var outputBuf bytes.Buffer
+	err := TranslateOpenAIStreamToClaude(strings.NewReader(streamInput), &outputBuf, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	outputStr := outputBuf.String()
+
+	// Tool call should be at index 0 (no text block preceding it)
+	if !strings.Contains(outputStr, `"index":0`) {
+		t.Errorf("tool call block should be at index 0:\n%s", outputStr)
+	}
+	if !strings.Contains(outputStr, `"call_xyz"`) {
+		t.Errorf("missing tool call ID:\n%s", outputStr)
+	}
+	if !strings.Contains(outputStr, `"search"`) {
+		t.Errorf("missing tool function name:\n%s", outputStr)
+	}
+	if !strings.Contains(outputStr, `"stop_reason":"tool_use"`) {
+		t.Errorf("missing stop_reason tool_use:\n%s", outputStr)
 	}
 }
 
@@ -755,6 +804,185 @@ func TestRewriteBodyGeminiThoughtSignatureInjection(t *testing.T) {
 	}
 }
 
+func TestTranslateClaudeRequestToOpenAI_SystemClaudeContent(t *testing.T) {
+	req := &ClaudeMessagesRequest{
+		Model: "gemini-flash-lite",
+		System: []ClaudeContent{
+			{
+				Type: "text",
+				Text: "System Instruction Part 1.",
+			},
+			{
+				Type: "text",
+				Text: " System Instruction Part 2.",
+			},
+		},
+		Messages: []ClaudeMessage{
+			{
+				Role:    "user",
+				Content: "Hello",
+			},
+		},
+	}
+	openaiReq, err := TranslateClaudeRequestToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	msgs := openaiReq["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %v", msgs)
+	}
+
+	sysMsg := msgs[0].(map[string]interface{})
+	if sysMsg["role"] != "system" || sysMsg["content"] != "System Instruction Part 1. System Instruction Part 2." {
+		t.Errorf("invalid system message: %v", sysMsg)
+	}
+}
+
+func TestTranslateClaudeRequestToOpenAI_MessagesClaudeContent(t *testing.T) {
+	req := &ClaudeMessagesRequest{
+		Model: "gemini-flash-lite",
+		Messages: []ClaudeMessage{
+			{
+				Role: "user",
+				Content: []ClaudeContent{
+					{
+						Type: "text",
+						Text: "Hello there",
+					},
+				},
+			},
+		},
+	}
+	openaiReq, err := TranslateClaudeRequestToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	msgs := openaiReq["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %v", msgs)
+	}
+
+	userMsg := msgs[0].(map[string]interface{})
+	contentParts := userMsg["content"].([]interface{})
+	if len(contentParts) != 1 {
+		t.Fatalf("expected 1 content part, got %v", contentParts)
+	}
+	part := contentParts[0].(map[string]interface{})
+	if part["type"] != "text" || part["text"] != "Hello there" {
+		t.Errorf("invalid part content: %v", part)
+	}
+}
+
+func TestTranslateClaudeRequestToOpenAI_ToolResultMixedWithText(t *testing.T) {
+	req := &ClaudeMessagesRequest{
+		Model: "gemini-flash-lite",
+		Messages: []ClaudeMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": "And here is the answer: ",
+					},
+					map[string]interface{}{
+						"type":        "tool_result",
+						"tool_use_id": "call_abc",
+						"content":     "The result is 42",
+					},
+				},
+			},
+		},
+	}
+	openaiReq, err := TranslateClaudeRequestToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	msgs := openaiReq["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %v", msgs)
+	}
+
+	// Sibling 0 should be the tool message
+	m0 := msgs[0].(map[string]interface{})
+	if m0["role"] != "tool" || m0["tool_call_id"] != "call_abc" || m0["content"] != "The result is 42" {
+		t.Errorf("invalid tool message: %v", m0)
+	}
+
+	// Sibling 1 should be the user text part message (appended after tool message)
+	m1 := msgs[1].(map[string]interface{})
+	if m1["role"] != "user" {
+		t.Errorf("expected role user for second message, got %v", m1["role"])
+	}
+	contentParts, ok := m1["content"].([]interface{})
+	if !ok || len(contentParts) != 1 {
+		t.Fatalf("expected 1 content part in user message, got %v", m1["content"])
+	}
+	part := contentParts[0].(map[string]interface{})
+	if part["type"] != "text" || part["text"] != "And here is the answer: " {
+		t.Errorf("invalid part content: %v", part)
+	}
+}
+
+func TestTranslateClaudeRequestToOpenAI_NilToolContent(t *testing.T) {
+	req := &ClaudeMessagesRequest{
+		Model: "gemini-flash-lite",
+		Messages: []ClaudeMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{
+						"type":        "tool_result",
+						"tool_use_id": "call_abc",
+						"content":     nil,
+					},
+				},
+			},
+		},
+	}
+	openaiReq, err := TranslateClaudeRequestToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	msgs := openaiReq["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %v", msgs)
+	}
+
+	m0 := msgs[0].(map[string]interface{})
+	if m0["role"] != "tool" || m0["content"] != "" {
+		t.Errorf("invalid tool message content: expected empty string, got %v", m0["content"])
+	}
+}
+
 func float64Ptr(v float64) *float64 {
 	return &v
+}
+
+func TestSanitizeToolName(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"valid_name_1", "valid_name_1"},
+		{"1_invalid_start", "_1_invalid_start"},
+		{"-invalid-start", "_-invalid-start"},
+		{"with-dashes-and:colons", "with-dashes-and:colons"},
+		{"with spaces", "with_spaces"},
+		{"with!@#symbols", "with___symbols"},
+		{"with.dots", "with.dots"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := sanitizeToolName(tt.input); got != tt.expected {
+				t.Errorf("sanitizeToolName(%q) = %q; want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
 }

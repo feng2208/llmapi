@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -507,6 +508,10 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 		req.Header.Del("x-api-key")
 	}
 
+	if requestType != "openai" {
+		req.Header.Del("Accept-Encoding")
+	}
+
 	if debug {
 		log.Printf("[DEBUG] Upstream Request: %s %s", req.Method, req.URL.String())
 		for k, v := range req.Header {
@@ -527,6 +532,17 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer resp.Body.Close()
+
+	if requestType != "openai" && resp.Header.Get("Content-Encoding") == "gzip" {
+		gzipReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			log.Printf("failed to create gzip reader: %v", err)
+			writeError(w, requestType, http.StatusInternalServerError, "Internal Server Error")
+			return
+		}
+		defer gzipReader.Close()
+		resp.Body = gzipReader
+	}
 
 	if debug {
 		log.Printf("[DEBUG] Upstream Response: %s", resp.Status)

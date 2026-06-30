@@ -22,6 +22,7 @@ type ClaudeContent struct {
 	Input     interface{}        `json:"input,omitempty"`
 	ToolUseID string             `json:"tool_use_id,omitempty"`
 	Content   interface{}        `json:"content,omitempty"`
+	IsError   *bool              `json:"is_error,omitempty"`
 }
 
 type ClaudeImageSource struct {
@@ -59,8 +60,8 @@ type ClaudeMessagesResponse struct {
 	Role         string          `json:"role"`
 	Content      []ClaudeContent `json:"content"`
 	Model        string          `json:"model"`
-	StopReason   string          `json:"stop_reason,omitempty"`
-	StopSequence string          `json:"stop_sequence,omitempty"`
+	StopReason   *string         `json:"stop_reason"`
+	StopSequence *string         `json:"stop_sequence"`
 	Usage        ClaudeUsage     `json:"usage"`
 }
 
@@ -149,6 +150,37 @@ func marshalJSONString(v interface{}) string {
 	return string(data)
 }
 
+// sanitizeToolName cleans tool names to meet Gemini's strict validation rules
+// "Must start with a letter or an underscore. Must be alphameric (a-z, A-Z, 0-9), underscores (_), dots (.), colons (:), or dashes (-), with a maximum length of 128."
+// Wait, the error is actually because Claude allows "-" but maybe Gemini is rejecting something else?
+// Ah, the user's error says: "Must be alphameric (a-z, A-Z, 0-9), underscores (_), dots (.), colons (:), or dashes (-)"
+// Wait, the error explicitly listed dashes (-), so why did it fail?
+// Because the user's tool name might have started with a dash, or had characters NOT in that list, or maybe Gemini's actual error message allows hyphens but the tool name had hyphens and the regex rejected it?
+// Let's replace any character that is not a-zA-Z0-9_.:- with underscore, and ensure it starts with letter or underscore.
+func sanitizeToolName(name string) string {
+	if name == "" {
+		return name
+	}
+	var sb strings.Builder
+	for i, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' {
+			sb.WriteRune(r)
+		} else if r >= '0' && r <= '9' || r == '.' || r == ':' || r == '-' {
+			if i == 0 {
+				sb.WriteRune('_') // must start with letter or underscore
+			}
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune('_')
+		}
+	}
+	res := sb.String()
+	if len(res) > 128 {
+		res = res[:128]
+	}
+	return res
+}
+
 // TranslateClaudeRequestToOpenAI converts Claude /v1/messages request to OpenAI /v1/chat/completions payload map.
 func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]interface{}, error) {
 	var openAIMessages []interface{}
@@ -165,6 +197,12 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 					if m["type"] == "text" {
 						systemContent += fmt.Sprintf("%v", m["text"])
 					}
+				}
+			}
+		case []ClaudeContent:
+			for _, item := range v {
+				if item.Type == "text" {
+					systemContent += item.Text
 				}
 			}
 		}
@@ -229,14 +267,16 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 					hasToolResult = true
 					toolContent := blockMap["content"]
 					contentStr := ""
-					if slice, ok := toolContent.([]interface{}); ok {
-						for _, item := range slice {
-							if m, ok := item.(map[string]interface{}); ok && m["type"] == "text" {
-								contentStr += fmt.Sprintf("%v", m["text"])
+					if toolContent != nil {
+						if slice, ok := toolContent.([]interface{}); ok {
+							for _, item := range slice {
+								if m, ok := item.(map[string]interface{}); ok && m["type"] == "text" {
+									contentStr += fmt.Sprintf("%v", m["text"])
+								}
 							}
+						} else {
+							contentStr = fmt.Sprintf("%v", toolContent)
 						}
-					} else {
-						contentStr = fmt.Sprintf("%v", toolContent)
 					}
 
 					if isErr, _ := blockMap["is_error"].(bool); isErr {
@@ -254,6 +294,116 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 			if hasToolResult {
 				for _, tr := range toolResults {
 					openAIMessages = append(openAIMessages, tr)
+				}
+				if len(parts) > 0 {
+					openAIMessages = append(openAIMessages, map[string]interface{}{
+						"role":    msg.Role,
+						"content": parts,
+					})
+				}
+				continue
+			}
+
+			if hasToolUse {
+				msgObj := map[string]interface{}{
+					"role": "assistant",
+				}
+				if len(textParts) > 0 {
+					var fullText string
+					for _, tp := range textParts {
+						fullText += fmt.Sprintf("%v", tp)
+					}
+					msgObj["content"] = fullText
+				}
+				msgObj["tool_calls"] = toolCalls
+				openAIMessages = append(openAIMessages, msgObj)
+				continue
+			}
+
+			if len(parts) > 0 {
+				openAIContent = parts
+			}
+		case []ClaudeContent:
+			var parts []interface{}
+			hasToolUse := false
+			hasToolResult := false
+			var toolCalls []interface{}
+			var toolResults []map[string]interface{}
+			var textParts []interface{}
+
+			for _, block := range contentVal {
+				blockType := block.Type
+
+				if blockType == "text" {
+					parts = append(parts, map[string]interface{}{
+						"type": "text",
+						"text": block.Text,
+					})
+					textParts = append(textParts, block.Text)
+				} else if blockType == "image" {
+					if block.Source != nil {
+						mediaType := block.Source.MediaType
+						data := block.Source.Data
+						parts = append(parts, map[string]interface{}{
+							"type": "image_url",
+							"image_url": map[string]interface{}{
+								"url": fmt.Sprintf("data:%s;base64,%s", mediaType, data),
+							},
+						})
+					}
+				} else if blockType == "tool_use" {
+					hasToolUse = true
+					toolCalls = append(toolCalls, map[string]interface{}{
+						"id":   block.ID,
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      block.Name,
+							"arguments": marshalJSONString(block.Input),
+						},
+					})
+				} else if blockType == "tool_result" {
+					hasToolResult = true
+					toolContent := block.Content
+					contentStr := ""
+					if toolContent != nil {
+						if slice, ok := toolContent.([]interface{}); ok {
+							for _, item := range slice {
+								if m, ok := item.(map[string]interface{}); ok && m["type"] == "text" {
+									contentStr += fmt.Sprintf("%v", m["text"])
+								}
+							}
+						} else if cSlice, ok := toolContent.([]ClaudeContent); ok {
+							for _, item := range cSlice {
+								if item.Type == "text" {
+									contentStr += item.Text
+								}
+							}
+						} else {
+							contentStr = fmt.Sprintf("%v", toolContent)
+						}
+					}
+
+					if block.IsError != nil && *block.IsError {
+						contentStr = "[ERROR] " + contentStr
+					}
+
+					toolResults = append(toolResults, map[string]interface{}{
+						"role":         "tool",
+						"tool_call_id": block.ToolUseID,
+						"content":      contentStr,
+					})
+				}
+			}
+
+			if hasToolResult {
+				for _, tr := range toolResults {
+					openAIMessages = append(openAIMessages, tr)
+				}
+				if len(parts) > 0 {
+					openAIMessages = append(openAIMessages, map[string]interface{}{
+						"role":    msg.Role,
+						"content": parts,
+					})
 				}
 				continue
 			}
@@ -293,7 +443,7 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 		openAITools = append(openAITools, map[string]interface{}{
 			"type": "function",
 			"function": map[string]interface{}{
-				"name":        t.Name,
+				"name":        sanitizeToolName(t.Name),
 				"description": t.Description,
 				"parameters":  t.InputSchema,
 			},
@@ -389,7 +539,7 @@ func TranslateOpenAIResponseToClaude(openaiResp map[string]interface{}) (*Claude
 
 	respID := ""
 	if id, ok := openaiResp["id"].(string); ok {
-		respID = id
+		respID = "msg_" + id
 	}
 
 	stopReason := "end_turn"
@@ -417,12 +567,13 @@ func TranslateOpenAIResponseToClaude(openaiResp map[string]interface{}) (*Claude
 	}
 
 	return &ClaudeMessagesResponse{
-		ID:         respID,
-		Type:       "message",
-		Role:       "assistant",
-		Content:    content,
-		Model:      modelStr,
-		StopReason: stopReason,
+		ID:           respID,
+		Type:         "message",
+		Role:         "assistant",
+		Content:      content,
+		Model:        modelStr,
+		StopReason:   &stopReason,
+		StopSequence: nil,
 		Usage: ClaudeUsage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
@@ -611,7 +762,7 @@ func TranslateResponsesRequestToOpenAI(req *OpenAIResponsesRequest) (map[string]
 				// Responses API flat format -> Chat Completions nested format
 				fnDef := map[string]interface{}{}
 				if name, ok := toolMap["name"]; ok {
-					fnDef["name"] = name
+					fnDef["name"] = sanitizeToolName(fmt.Sprintf("%v", name))
 				}
 				if desc, ok := toolMap["description"]; ok {
 					fnDef["description"] = desc
@@ -753,10 +904,10 @@ type OpenAIMessageChunk struct {
 		Delta struct {
 			Content   string `json:"content"`
 			ToolCalls []struct {
-				Index        int    `json:"index"`
-				ID           string `json:"id"`
-				Type         string `json:"type"`
-				Function     struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
 				} `json:"function"`
@@ -794,11 +945,16 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 	}
 
 	scanner := bufio.NewScanner(r)
+	// Use a 10MB buffer to handle extremely large lines (e.g. nested images or large thought blocks)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
 	flusher, hasFlush := w.(http.Flusher)
 
 	messageStarted := false
 	textBlockStarted := false
-	activeToolCalls := make(map[int]string) // index -> tool ID
+	nextBlockIndex := 0
+	activeToolCalls := make(map[int]int) // OpenAI tc.Index -> Claude block index
+	stopReasonSent := false
 
 	var lastChunkID string
 	var lastChunkModel string
@@ -827,6 +983,13 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 			continue
 		}
 
+		if chunk.ID != "" {
+			lastChunkID = chunk.ID
+		}
+		if chunk.Model != "" {
+			lastChunkModel = chunk.Model
+		}
+
 		if len(chunk.Choices) == 0 {
 			// Might be a usage-only or empty chunk
 			if chunk.Usage != nil && messageStarted {
@@ -843,20 +1006,23 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 		}
 
 		choice := chunk.Choices[0]
-		lastChunkID = chunk.ID
-		lastChunkModel = chunk.Model
 
 		// 1. Send message_start if not sent yet
 		if !messageStarted {
+			msgID := chunk.ID
+			if !strings.HasPrefix(msgID, "msg_") {
+				msgID = "msg_" + msgID
+			}
 			startEvent := map[string]interface{}{
 				"type": "message_start",
 				"message": map[string]interface{}{
-					"id":          "msg_" + chunk.ID,
-					"type":        "message",
-					"role":        "assistant",
-					"content":     []interface{}{},
-					"model":       chunk.Model,
-					"stop_reason": nil,
+					"id":            msgID,
+					"type":          "message",
+					"role":          "assistant",
+					"content":       []interface{}{},
+					"model":         chunk.Model,
+					"stop_reason":   nil,
+					"stop_sequence": nil,
 					"usage": map[string]interface{}{
 						"input_tokens":  0,
 						"output_tokens": 0,
@@ -874,7 +1040,7 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 			if !textBlockStarted {
 				startBlock := map[string]interface{}{
 					"type":  "content_block_start",
-					"index": 0,
+					"index": nextBlockIndex,
 					"content_block": map[string]interface{}{
 						"type": "text",
 						"text": "",
@@ -884,11 +1050,13 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 					return err
 				}
 				textBlockStarted = true
+				nextBlockIndex++
 			}
 
+			textBlockIdx := nextBlockIndex - 1 // text block was the last one opened
 			deltaEvent := map[string]interface{}{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": textBlockIdx,
 				"delta": map[string]interface{}{
 					"type": "text_delta",
 					"text": choice.Delta.Content,
@@ -902,13 +1070,15 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 		// 3. Handle Tool Calls Delta
 		if len(choice.Delta.ToolCalls) > 0 {
 			for _, tc := range choice.Delta.ToolCalls {
-				_, active := activeToolCalls[tc.Index]
+				blockIdx, active := activeToolCalls[tc.Index]
 				if !active && tc.ID != "" {
-					activeToolCalls[tc.Index] = tc.ID
+					blockIdx = nextBlockIndex
+					activeToolCalls[tc.Index] = blockIdx
+					nextBlockIndex++
 					// Start tool use block
 					startBlock := map[string]interface{}{
 						"type":  "content_block_start",
-						"index": tc.Index + 1, // shift index to avoid conflict with text block
+						"index": blockIdx,
 						"content_block": map[string]interface{}{
 							"type":  "tool_use",
 							"id":    tc.ID,
@@ -924,7 +1094,7 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 				if tc.Function.Arguments != "" {
 					deltaEvent := map[string]interface{}{
 						"type":  "content_block_delta",
-						"index": tc.Index + 1,
+						"index": blockIdx,
 						"delta": map[string]interface{}{
 							"type":         "input_json_delta",
 							"partial_json": tc.Function.Arguments,
@@ -940,9 +1110,23 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 		// 4. Handle finish reason
 		if choice.FinishReason != "" {
 			if textBlockStarted {
+				textBlockIdx := 0 // text block is always index 0 when it exists
+				for i := 0; i < nextBlockIndex; i++ {
+					isToolBlock := false
+					for _, bi := range activeToolCalls {
+						if bi == i {
+							isToolBlock = true
+							break
+						}
+					}
+					if !isToolBlock {
+						textBlockIdx = i
+						break
+					}
+				}
 				stopBlock := map[string]interface{}{
 					"type":  "content_block_stop",
-					"index": 0,
+					"index": textBlockIdx,
 				}
 				if err := writeSSEEvent(targetWriter, "content_block_stop", stopBlock); err != nil {
 					return err
@@ -950,16 +1134,16 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 				textBlockStarted = false
 			}
 
-			for idx := range activeToolCalls {
+			for _, blockIdx := range activeToolCalls {
 				stopBlock := map[string]interface{}{
 					"type":  "content_block_stop",
-					"index": idx + 1,
+					"index": blockIdx,
 				}
 				if err := writeSSEEvent(targetWriter, "content_block_stop", stopBlock); err != nil {
 					return err
 				}
 			}
-			activeToolCalls = make(map[int]string)
+			activeToolCalls = make(map[int]int)
 
 			stopReason := "end_turn"
 			switch choice.FinishReason {
@@ -988,6 +1172,7 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 			if err := writeSSEEvent(targetWriter, "message_delta", msgDelta); err != nil {
 				return err
 			}
+			stopReasonSent = true
 		}
 
 		if hasFlush {
@@ -997,6 +1182,16 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 
 	// Close the message cleanly
 	if messageStarted {
+		if !stopReasonSent {
+			msgDelta := map[string]interface{}{
+				"type": "message_delta",
+				"delta": map[string]interface{}{
+					"stop_reason":   "end_turn",
+					"stop_sequence": nil,
+				},
+			}
+			writeSSEEvent(targetWriter, "message_delta", msgDelta)
+		}
 		writeSSEEvent(targetWriter, "message_stop", map[string]interface{}{"type": "message_stop"})
 	} else {
 		// Fallback start + stop if stream was completely empty
@@ -1039,13 +1234,13 @@ type responsesStreamState struct {
 	seq              int
 	responseCreated  bool
 	messageItemAdded bool
-	contentPartAdded  bool
-	messageItemID     string
-	accumulatedText   strings.Builder
-	activeToolCalls   map[int]*responsesToolCallState
-	lastChunkID       string
-	lastChunkModel    string
-	messageItemDone   bool
+	contentPartAdded bool
+	messageItemID    string
+	accumulatedText  strings.Builder
+	activeToolCalls  map[int]*responsesToolCallState
+	lastChunkID      string
+	lastChunkModel   string
+	messageItemDone  bool
 }
 
 func (s *responsesStreamState) nextSeq() int {
@@ -1126,9 +1321,9 @@ func (s *responsesStreamState) ensureContentPart(w io.Writer) error {
 		return err
 	}
 	if err := s.emit(w, "response.content_part.added", map[string]interface{}{
-		"item_id":        s.messageItemID,
-		"output_index":   s.messageOutputIndex(),
-		"content_index":  0,
+		"item_id":       s.messageItemID,
+		"output_index":  s.messageOutputIndex(),
+		"content_index": 0,
 		"part": map[string]interface{}{
 			"type": "output_text",
 			"text": "",
@@ -1318,6 +1513,9 @@ func TranslateOpenAIStreamToResponses(r io.Reader, w io.Writer, debug bool) erro
 	}
 
 	scanner := bufio.NewScanner(r)
+	// Use a 10MB buffer to handle extremely large lines (e.g. nested images or large thought blocks)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
 	flusher, hasFlush := w.(http.Flusher)
 
 	state := &responsesStreamState{}
@@ -1396,6 +1594,11 @@ func TranslateOpenAIStreamToResponses(r io.Reader, w io.Writer, debug bool) erro
 		if hasFlush {
 			flusher.Flush()
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("scanner error during OpenAI to Responses stream: %v", err)
+		return fmt.Errorf("scanner error: %w", err)
 	}
 
 	if err := state.finalize(targetWriter); err != nil {
