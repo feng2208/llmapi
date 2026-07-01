@@ -1115,3 +1115,60 @@ data: [DONE]
 	}
 }
 
+func TestTranslateOpenAIResponseToOpenAI_WithThoughts(t *testing.T) {
+	openaiResp := map[string]interface{}{
+		"choices": []interface{}{
+			map[string]interface{}{
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "<thought>I am thinking.</thought>Hello world!",
+				},
+			},
+		},
+	}
+
+	translated, err := TranslateOpenAIResponseToOpenAI(openaiResp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := translated.(map[string]interface{})
+	choices := resp["choices"].([]interface{})
+	msg := choices[0].(map[string]interface{})["message"].(map[string]interface{})
+
+	if msg["reasoning"] != "I am thinking." {
+		t.Errorf("expected reasoning 'I am thinking.', got %v", msg["reasoning"])
+	}
+	if msg["content"] != "Hello world!" {
+		t.Errorf("expected content 'Hello world!', got %v", msg["content"])
+	}
+}
+
+func TestTranslateOpenAIStreamToOpenAI_WithThoughts(t *testing.T) {
+	streamInput := `data: {"id":"chatcmpl-123","choices":[{"index":0,"delta":{"content":"Prefix <tho"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","choices":[{"index":0,"delta":{"content":"ught>Thinking</thou"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","choices":[{"index":0,"delta":{"content":"ght>Suffix"},"finish_reason":null}]}
+data: [DONE]
+`
+	var outputBuf bytes.Buffer
+	err := TranslateOpenAIStreamToOpenAI(strings.NewReader(streamInput), &outputBuf, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	outputStr := outputBuf.String()
+
+	if !strings.Contains(outputStr, `"content":"Prefix "`) {
+		t.Errorf("missing content 'Prefix '")
+	}
+	if !strings.Contains(outputStr, `"reasoning":"Thinking"`) {
+		t.Errorf("missing reasoning 'Thinking'")
+	}
+	if !strings.Contains(outputStr, `"content":"Suffix"`) {
+		t.Errorf("missing content 'Suffix'")
+	}
+	if !strings.Contains(outputStr, "data: [DONE]") {
+		t.Errorf("missing DONE data")
+	}
+}
+

@@ -606,6 +606,18 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 				return TranslateOpenAIResponseToResponses(openaiResp)
 			})
 		}
+	} else if requestType == "openai" {
+		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(resp.StatusCode)
+			if err := TranslateOpenAIStreamToOpenAI(resp.Body, w, debug); err != nil {
+				log.Printf("failed to translate openai stream: %v", err)
+			}
+		} else {
+			translateAndWriteJSON(w, resp, debug, requestType, func(openaiResp map[string]interface{}) (interface{}, error) {
+				return TranslateOpenAIResponseToOpenAI(openaiResp)
+			})
+		}
 	} else {
 		streamResponse(w, resp, debug)
 	}

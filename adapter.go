@@ -1251,6 +1251,39 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 	return nil
 }
 
+func TranslateOpenAIResponseToOpenAI(openaiResp map[string]interface{}) (interface{}, error) {
+	choices, ok := openaiResp["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return openaiResp, nil
+	}
+
+	for _, choiceVal := range choices {
+		choice, ok := choiceVal.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		if val, ok := message["content"]; ok && val != nil {
+			if contentStr, ok := val.(string); ok && contentStr != "" {
+				re := regexp.MustCompile(`(?s)<thought>(.*?)</thought>`)
+				match := re.FindStringSubmatch(contentStr)
+				if len(match) > 1 {
+					thoughtText := strings.TrimSpace(match[1])
+					message["reasoning"] = thoughtText
+					// Remove thought from content
+					newContent := strings.TrimSpace(re.ReplaceAllString(contentStr, ""))
+					message["content"] = newContent
+				}
+			}
+		}
+	}
+	return openaiResp, nil
+}
+
 type responsesToolCallState struct {
 	id           string
 	name         string
@@ -1964,6 +1997,214 @@ func TranslateOpenAIStreamToResponses(r io.Reader, w io.Writer, debug bool) erro
 		flusher.Flush()
 	}
 	return nil
+}
+
+// TranslateOpenAIStreamToOpenAI processes OpenAI stream to extract thoughts into reasoning field.
+func TranslateOpenAIStreamToOpenAI(r io.Reader, w io.Writer, debug bool) error {
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+	flusher, hasFlush := w.(http.Flusher)
+
+	inReasoning := false
+	textBuffer := ""
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			fmt.Fprint(w, line+"\n")
+			if hasFlush {
+				flusher.Flush()
+			}
+			continue
+		}
+
+		dataPayload := strings.TrimPrefix(line, "data: ")
+		if dataPayload == "[DONE]" {
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			if hasFlush {
+				flusher.Flush()
+			}
+			break
+		}
+
+		var chunk map[string]interface{}
+		if err := json.Unmarshal([]byte(dataPayload), &chunk); err != nil {
+			fmt.Fprint(w, line+"\n\n")
+			if hasFlush {
+				flusher.Flush()
+			}
+			continue
+		}
+
+		choices, ok := chunk["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
+			writeSSEEventRaw(w, chunk)
+			if hasFlush {
+				flusher.Flush()
+			}
+			continue
+		}
+
+		choice := choices[0].(map[string]interface{})
+		delta, ok := choice["delta"].(map[string]interface{})
+		if !ok {
+			writeSSEEventRaw(w, chunk)
+			if hasFlush {
+				flusher.Flush()
+			}
+			continue
+		}
+
+		content, ok := delta["content"].(string)
+		if !ok || content == "" {
+			writeSSEEventRaw(w, chunk)
+			if hasFlush {
+				flusher.Flush()
+			}
+			continue
+		}
+
+		textBuffer += content
+
+		for {
+			if !inReasoning {
+				idx := strings.Index(textBuffer, "<thought>")
+				if idx != -1 {
+					prefix := textBuffer[:idx]
+					if prefix != "" {
+						emitOpenAIContent(w, chunk, prefix)
+					}
+					inReasoning = true
+					textBuffer = textBuffer[idx+len("<thought>"):]
+					continue
+				}
+
+				possibleTag := false
+				tag := "<thought>"
+				for i := 1; i < len(tag); i++ {
+					if strings.HasSuffix(textBuffer, tag[:i]) {
+						possibleTag = true
+						definiteText := textBuffer[:len(textBuffer)-i]
+						if definiteText != "" {
+							emitOpenAIContent(w, chunk, definiteText)
+							textBuffer = textBuffer[len(textBuffer)-i:]
+						}
+						break
+					}
+				}
+
+				if !possibleTag {
+					if textBuffer != "" {
+						emitOpenAIContent(w, chunk, textBuffer)
+						textBuffer = ""
+					}
+				}
+				break
+			} else {
+				idx := strings.Index(textBuffer, "</thought>")
+				if idx != -1 {
+					prefix := textBuffer[:idx]
+					if prefix != "" {
+						emitOpenAIReasoning(w, chunk, prefix)
+					}
+					inReasoning = false
+					textBuffer = textBuffer[idx+len("</thought>"):]
+					continue
+				}
+
+				possibleTag := false
+				tag := "</thought>"
+				for i := 1; i < len(tag); i++ {
+					if strings.HasSuffix(textBuffer, tag[:i]) {
+						possibleTag = true
+						definiteText := textBuffer[:len(textBuffer)-i]
+						if definiteText != "" {
+							emitOpenAIReasoning(w, chunk, definiteText)
+							textBuffer = textBuffer[len(textBuffer)-i:]
+						}
+						break
+					}
+				}
+
+				if !possibleTag {
+					if textBuffer != "" {
+						emitOpenAIReasoning(w, chunk, textBuffer)
+						textBuffer = ""
+					}
+				}
+				break
+			}
+		}
+
+		if hasFlush {
+			flusher.Flush()
+		}
+	}
+
+	return nil
+}
+
+func writeSSEEventRaw(w io.Writer, data interface{}) error {
+	payload, err := marshalNoEscape(data)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", string(payload)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func emitOpenAIContent(w io.Writer, baseChunk map[string]interface{}, content string) {
+	newChunk := copyChunkForMutation(baseChunk)
+	choices := newChunk["choices"].([]interface{})
+	choice := choices[0].(map[string]interface{})
+	delta := choice["delta"].(map[string]interface{})
+	delta["content"] = content
+	delete(delta, "reasoning")
+	writeSSEEventRaw(w, newChunk)
+}
+
+func emitOpenAIReasoning(w io.Writer, baseChunk map[string]interface{}, reasoning string) {
+	newChunk := copyChunkForMutation(baseChunk)
+	choices := newChunk["choices"].([]interface{})
+	choice := choices[0].(map[string]interface{})
+	delta := choice["delta"].(map[string]interface{})
+	delta["reasoning"] = reasoning
+	delete(delta, "content")
+	writeSSEEventRaw(w, newChunk)
+}
+
+func copyChunkForMutation(base map[string]interface{}) map[string]interface{} {
+	newMap := make(map[string]interface{})
+	for k, v := range base {
+		if k == "choices" {
+			choices, _ := v.([]interface{})
+			newChoices := make([]interface{}, len(choices))
+			for i, c := range choices {
+				choice, _ := c.(map[string]interface{})
+				newChoice := make(map[string]interface{})
+				for ck, cv := range choice {
+					if ck == "delta" {
+						delta, _ := cv.(map[string]interface{})
+						newDelta := make(map[string]interface{})
+						for dk, dv := range delta {
+							newDelta[dk] = dv
+						}
+						newChoice[ck] = newDelta
+					} else {
+						newChoice[ck] = cv
+					}
+				}
+				newChoices[i] = newChoice
+			}
+			newMap[k] = newChoices
+		} else {
+			newMap[k] = v
+		}
+	}
+	return newMap
 }
 
 func writeSSEEvent(w io.Writer, event string, data interface{}) error {
