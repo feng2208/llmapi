@@ -196,6 +196,77 @@ func TestTranslateOpenAIResponseToClaude(t *testing.T) {
 	}
 }
 
+func TestTranslateOpenAIResponseToResponses_WithThoughts(t *testing.T) {
+	openaiResp := map[string]interface{}{
+		"id":    "resp-123",
+		"model": "gemini-2.5-flash-lite",
+		"choices": []interface{}{
+			map[string]interface{}{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "<thought>\n**Calculating volume of gold for Pluto layer**\n\nStarting with the approximation...\n</thought>\nPluto has a lot of gold.",
+				},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]interface{}{
+			"prompt_tokens":     12.0,
+			"completion_tokens": 18.0,
+		},
+	}
+
+	responsesResp, err := TranslateOpenAIResponseToResponses(openaiResp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if responsesResp.ID != "resp-123" {
+		t.Errorf("expected ID resp-123, got %s", responsesResp.ID)
+	}
+	if len(responsesResp.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(responsesResp.Output))
+	}
+
+	// 1. Verify reasoning item
+	reasoningItem, ok := responsesResp.Output[0].(map[string]interface{})
+	if !ok || reasoningItem["type"] != "reasoning" {
+		t.Errorf("expected first item to be reasoning, got %v", responsesResp.Output[0])
+	}
+	if reasoningItem["id"] != "rs_resp-123" {
+		t.Errorf("expected reasoning ID rs_resp-123, got %v", reasoningItem["id"])
+	}
+	content, ok := reasoningItem["content"].([]interface{})
+	if !ok || len(content) != 1 {
+		t.Fatalf("expected 1 content part, got %v", reasoningItem["content"])
+	}
+	contentPart, ok := content[0].(map[string]interface{})
+	if !ok || contentPart["type"] != "reasoning_text" || contentPart["text"] != "**Calculating volume of gold for Pluto layer**\n\nStarting with the approximation..." {
+		t.Errorf("invalid reasoning text: %v", contentPart)
+	}
+
+	// 2. Verify message item
+	msg, ok := responsesResp.Output[1].(OpenAIOutputMessage)
+	if !ok || msg.Role != "assistant" || msg.Type != "message" {
+		t.Errorf("invalid message output: %v", responsesResp.Output[1])
+	}
+	if msg.ID != "msg_resp-123" {
+		t.Errorf("expected message ID msg_resp-123, got %s", msg.ID)
+	}
+	if len(msg.Content) != 1 {
+		t.Fatalf("expected 1 output part, got %d", len(msg.Content))
+	}
+	part := msg.Content[0]
+	if part.Type != "output_text" || part.Text != "Pluto has a lot of gold." {
+		t.Errorf("invalid text part: %v", part)
+	}
+
+	// 3. Verify usage
+	if responsesResp.Usage.InputTokens != 12 || responsesResp.Usage.OutputTokens != 18 || responsesResp.Usage.TotalTokens != 30 {
+		t.Errorf("invalid usage: %+v", responsesResp.Usage)
+	}
+}
+
 func TestTranslateOpenAIStreamToClaude(t *testing.T) {
 	streamInput := `data: {"id":"chatcmpl-123","model":"gemini-2.5-flash-lite","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
 data: {"id":"chatcmpl-123","model":"gemini-2.5-flash-lite","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}
@@ -394,16 +465,22 @@ func TestTranslateOpenAIResponseToResponses(t *testing.T) {
 	if len(responsesResp.Output) != 1 {
 		t.Fatalf("expected 1 output message, got %d", len(responsesResp.Output))
 	}
-	msg := responsesResp.Output[0]
-	if msg.Role != "assistant" || msg.Type != "message" {
-		t.Errorf("invalid message output: %v", msg)
+	msg, ok := responsesResp.Output[0].(OpenAIOutputMessage)
+	if !ok || msg.Role != "assistant" || msg.Type != "message" {
+		t.Errorf("invalid message output: %v", responsesResp.Output[0])
+	}
+	if msg.ID != "msg_resp-123" {
+		t.Errorf("expected message ID msg_resp-123, got %s", msg.ID)
 	}
 	if len(msg.Content) != 1 {
 		t.Fatalf("expected 1 output part, got %d", len(msg.Content))
 	}
 	part := msg.Content[0]
-	if part.Type != "text" || part.Text != "Responses API response content" {
+	if part.Type != "output_text" || part.Text != "Responses API response content" {
 		t.Errorf("invalid text part: %v", part)
+	}
+	if responsesResp.Usage.InputTokens != 12 || responsesResp.Usage.OutputTokens != 18 || responsesResp.Usage.TotalTokens != 30 {
+		t.Errorf("invalid usage: %+v", responsesResp.Usage)
 	}
 }
 
@@ -709,8 +786,8 @@ func TestTranslateOpenAIResponseToResponsesWithExtraContent(t *testing.T) {
 	if len(resp.Output) != 1 {
 		t.Fatalf("expected 1 output message, got %d", len(resp.Output))
 	}
-	m := resp.Output[0]
-	if len(m.Content) != 1 {
+	m, ok := resp.Output[0].(OpenAIOutputMessage)
+	if !ok || len(m.Content) != 1 {
 		t.Fatalf("expected 1 part, got %d", len(m.Content))
 	}
 	part := m.Content[0]
@@ -986,3 +1063,55 @@ func TestSanitizeToolName(t *testing.T) {
 		})
 	}
 }
+
+func TestTranslateOpenAIStreamToResponses_WithThoughts(t *testing.T) {
+	// Simulate split tags across chunks
+	streamInput := `data: {"id":"resp-123","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Prefix <tho"},"finish_reason":null}]}
+data: {"id":"resp-123","model":"gpt-4","choices":[{"index":0,"delta":{"content":"ught>Thinking</thou"},"finish_reason":null}]}
+data: {"id":"resp-123","model":"gpt-4","choices":[{"index":0,"delta":{"content":"ght>Suffix"},"finish_reason":null}]}
+data: [DONE]
+`
+	var outputBuf bytes.Buffer
+	err := TranslateOpenAIStreamToResponses(strings.NewReader(streamInput), &outputBuf, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	outputStr := outputBuf.String()
+	// t.Logf("Output: %s", outputStr)
+
+	// Verify Reasoning Events
+	if !strings.Contains(outputStr, "response.output_item.added") || !strings.Contains(outputStr, `"type":"reasoning"`) {
+		t.Errorf("missing reasoning item added event")
+	}
+	if !strings.Contains(outputStr, "response.reasoning_text.delta") || !strings.Contains(outputStr, `"delta":"Thinking"`) {
+		t.Errorf("missing reasoning text delta")
+	}
+	if !strings.Contains(outputStr, "response.reasoning_text.done") {
+		t.Errorf("missing reasoning text done")
+	}
+
+	// Verify Message Events
+	if !strings.Contains(outputStr, `"type":"output_text"`) {
+		t.Errorf("missing content part added for message")
+	}
+	if !strings.Contains(outputStr, `"delta":"Prefix "`) {
+		t.Errorf("missing message text delta 'Prefix '")
+	}
+	if !strings.Contains(outputStr, `"delta":"Suffix"`) {
+		t.Errorf("missing message text delta 'Suffix'")
+	}
+
+	// Verify final response object in response.completed
+	if !strings.Contains(outputStr, `"status":"completed"`) {
+		t.Errorf("missing response.completed event")
+	}
+	// Verify total output contains both reasoning and message
+	if strings.Count(outputStr, `"type":"reasoning"`) < 2 { // once in added, once in done/completed
+		t.Errorf("reasoning item not fully accounted for in output")
+	}
+	if strings.Count(outputStr, `"type":"message"`) < 2 {
+		t.Errorf("message item not fully accounted for in output")
+	}
+}
+

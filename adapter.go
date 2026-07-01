@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -83,14 +84,15 @@ type OpenAIResponsesRequest struct {
 }
 
 type OpenAIResponsesResponse struct {
-	ID     string                `json:"id"`
-	Object string                `json:"object"`
-	Model  string                `json:"model"`
-	Output []OpenAIOutputMessage `json:"output"`
-	Usage  OpenAIUsage           `json:"usage,omitempty"`
+	ID     string        `json:"id"`
+	Object string        `json:"object"`
+	Model  string        `json:"model"`
+	Output []interface{} `json:"output"`
+	Usage  OpenAIUsage   `json:"usage,omitempty"`
 }
 
 type OpenAIOutputMessage struct {
+	ID      string       `json:"id,omitempty"`
 	Type    string       `json:"type"`
 	Role    string       `json:"role"`
 	Content []OpenAIPart `json:"content"`
@@ -110,8 +112,9 @@ type OpenAIPartFunction struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
 }
 
 // marshalNoEscape marshals JSON without escaping HTML characters like < and >
@@ -815,13 +818,25 @@ func TranslateOpenAIResponseToResponses(openaiResp map[string]interface{}) (*Ope
 	}
 
 	var outputParts []OpenAIPart
+	var thoughtText string
 
 	if val, ok := message["content"]; ok && val != nil {
 		if contentStr, ok := val.(string); ok && contentStr != "" {
-			outputParts = append(outputParts, OpenAIPart{
-				Type: "text",
-				Text: contentStr,
-			})
+			// Extract thought
+			re := regexp.MustCompile(`(?s)<thought>(.*?)</thought>`)
+			match := re.FindStringSubmatch(contentStr)
+			if len(match) > 1 {
+				thoughtText = strings.TrimSpace(match[1])
+				// Remove thought from content
+				contentStr = strings.TrimSpace(re.ReplaceAllString(contentStr, ""))
+			}
+
+			if contentStr != "" {
+				outputParts = append(outputParts, OpenAIPart{
+					Type: "output_text",
+					Text: contentStr,
+				})
+			}
 		}
 	}
 
@@ -854,9 +869,29 @@ func TranslateOpenAIResponseToResponses(openaiResp map[string]interface{}) (*Ope
 		}
 	}
 
-	var finalOutput []OpenAIOutputMessage
+	var finalOutput []interface{}
+
+	respID := ""
+	if id, ok := openaiResp["id"].(string); ok {
+		respID = id
+	}
+
+	if thoughtText != "" {
+		finalOutput = append(finalOutput, map[string]interface{}{
+			"type": "reasoning",
+			"id":   "rs_" + respID,
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "reasoning_text",
+					"text": thoughtText,
+				},
+			},
+		})
+	}
+
 	if len(outputParts) > 0 {
 		finalOutput = append(finalOutput, OpenAIOutputMessage{
+			ID:      "msg_" + respID,
 			Type:    "message",
 			Role:    "assistant",
 			Content: outputParts,
@@ -866,11 +901,6 @@ func TranslateOpenAIResponseToResponses(openaiResp map[string]interface{}) (*Ope
 	modelStr := ""
 	if m, ok := openaiResp["model"].(string); ok {
 		modelStr = m
-	}
-
-	respID := ""
-	if id, ok := openaiResp["id"].(string); ok {
-		respID = id
 	}
 
 	var pt, ct int
@@ -889,8 +919,9 @@ func TranslateOpenAIResponseToResponses(openaiResp map[string]interface{}) (*Ope
 		Model:  modelStr,
 		Output: finalOutput,
 		Usage: OpenAIUsage{
-			PromptTokens:     pt,
-			CompletionTokens: ct,
+			InputTokens:  pt,
+			OutputTokens: ct,
+			TotalTokens:  pt + ct,
 		},
 	}, nil
 }
@@ -1231,16 +1262,25 @@ type responsesToolCallState struct {
 }
 
 type responsesStreamState struct {
-	seq              int
-	responseCreated  bool
-	messageItemAdded bool
-	contentPartAdded bool
-	messageItemID    string
-	accumulatedText  strings.Builder
-	activeToolCalls  map[int]*responsesToolCallState
-	lastChunkID      string
-	lastChunkModel   string
-	messageItemDone  bool
+	seq                  int
+	responseCreated      bool
+	messageItemAdded     bool
+	contentPartAdded     bool
+	messageItemID        string
+	accumulatedText      strings.Builder
+	activeToolCalls      map[int]*responsesToolCallState
+	lastChunkID          string
+	lastChunkModel       string
+	messageItemDone      bool
+	reasoningItemAdded   bool
+	reasoningPartAdded   bool
+	reasoningItemID     string
+	accumulatedReasoning strings.Builder
+	reasoningItemDone    bool
+	inReasoning          bool
+	textBuffer           string
+	outputIndices        map[string]int // type -> index
+	nextOutputIndex      int
 }
 
 func (s *responsesStreamState) nextSeq() int {
@@ -1281,15 +1321,103 @@ func (s *responsesStreamState) ensureCreated(w io.Writer) error {
 	})
 }
 
-func (s *responsesStreamState) messageOutputIndex() int {
-	return 0
+func (s *responsesStreamState) getOutputIndex(itemKey string) int {
+	if s.outputIndices == nil {
+		s.outputIndices = make(map[string]int)
+	}
+	if idx, ok := s.outputIndices[itemKey]; ok {
+		return idx
+	}
+	idx := s.nextOutputIndex
+	s.outputIndices[itemKey] = idx
+	s.nextOutputIndex++
+	return idx
 }
 
-func (s *responsesStreamState) toolOutputIndex(tcIndex int) int {
-	if s.messageItemAdded {
-		return tcIndex + 1
+func (s *responsesStreamState) ensureReasoningItem(w io.Writer) error {
+	if s.reasoningItemAdded {
+		return nil
 	}
-	return tcIndex
+	s.reasoningItemID = "rs_" + s.lastChunkID
+	if err := s.emit(w, "response.output_item.added", map[string]interface{}{
+		"output_index": s.getOutputIndex("reasoning"),
+		"item": map[string]interface{}{
+			"type":    "reasoning",
+			"id":      s.reasoningItemID,
+			"status":  "in_progress",
+			"content": []interface{}{},
+		},
+	}); err != nil {
+		return err
+	}
+	s.reasoningItemAdded = true
+	return nil
+}
+
+func (s *responsesStreamState) ensureReasoningPart(w io.Writer) error {
+	if s.reasoningPartAdded {
+		return nil
+	}
+	if err := s.ensureReasoningItem(w); err != nil {
+		return err
+	}
+	if err := s.emit(w, "response.content_part.added", map[string]interface{}{
+		"item_id":       s.reasoningItemID,
+		"output_index":  s.getOutputIndex("reasoning"),
+		"content_index": 0,
+		"part": map[string]interface{}{
+			"type": "reasoning_text",
+			"text": "",
+		},
+	}); err != nil {
+		return err
+	}
+	s.reasoningPartAdded = true
+	return nil
+}
+
+func (s *responsesStreamState) finalizeReasoningItem(w io.Writer) error {
+	if !s.reasoningPartAdded || s.reasoningItemDone {
+		return nil
+	}
+	text := s.accumulatedReasoning.String()
+	if err := s.emit(w, "response.reasoning_text.done", map[string]interface{}{
+		"item_id":       s.reasoningItemID,
+		"output_index":  s.getOutputIndex("reasoning"),
+		"content_index": 0,
+		"text":          text,
+	}); err != nil {
+		return err
+	}
+	if err := s.emit(w, "response.content_part.done", map[string]interface{}{
+		"item_id":       s.reasoningItemID,
+		"output_index":  s.getOutputIndex("reasoning"),
+		"content_index": 0,
+		"part": map[string]interface{}{
+			"type": "reasoning_text",
+			"text": text,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := s.emit(w, "response.output_item.done", map[string]interface{}{
+		"output_index": s.getOutputIndex("reasoning"),
+		"item": map[string]interface{}{
+			"id":     s.reasoningItemID,
+			"type":   "reasoning",
+			"status": "completed",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "reasoning_text",
+					"text": text,
+				},
+			},
+		},
+	}); err != nil {
+		return err
+	}
+	s.reasoningItemDone = true
+	return nil
 }
 
 func (s *responsesStreamState) ensureMessageItem(w io.Writer) error {
@@ -1298,7 +1426,7 @@ func (s *responsesStreamState) ensureMessageItem(w io.Writer) error {
 	}
 	s.messageItemID = "msg_" + s.lastChunkID
 	if err := s.emit(w, "response.output_item.added", map[string]interface{}{
-		"output_index": s.messageOutputIndex(),
+		"output_index": s.getOutputIndex("message"),
 		"item": map[string]interface{}{
 			"type":    "message",
 			"id":      s.messageItemID,
@@ -1322,7 +1450,7 @@ func (s *responsesStreamState) ensureContentPart(w io.Writer) error {
 	}
 	if err := s.emit(w, "response.content_part.added", map[string]interface{}{
 		"item_id":       s.messageItemID,
-		"output_index":  s.messageOutputIndex(),
+		"output_index":  s.getOutputIndex("message"),
 		"content_index": 0,
 		"part": map[string]interface{}{
 			"type": "output_text",
@@ -1343,7 +1471,7 @@ func (s *responsesStreamState) ensureToolCallItem(w io.Writer, tcIndex int, tcID
 	if !ok {
 		state = &responsesToolCallState{
 			id:           tcID,
-			outputIndex:  s.toolOutputIndex(tcIndex),
+			outputIndex:  s.getOutputIndex(fmt.Sprintf("tool_%d", tcIndex)),
 			extraContent: extraContent,
 		}
 		s.activeToolCalls[tcIndex] = state
@@ -1388,14 +1516,14 @@ func (s *responsesStreamState) finalizeMessageItem(w io.Writer) error {
 	text := s.accumulatedText.String()
 	if err := s.emit(w, "response.output_text.done", map[string]interface{}{
 		"item_id":       s.messageItemID,
-		"output_index":  s.messageOutputIndex(),
+		"output_index":  s.getOutputIndex("message"),
 		"content_index": 0,
 		"text":          text,
 	}); err != nil {
 		return err
 	}
 	if err := s.emit(w, "response.output_item.done", map[string]interface{}{
-		"output_index": s.messageOutputIndex(),
+		"output_index": s.getOutputIndex("message"),
 		"item": map[string]interface{}{
 			"type":   "message",
 			"id":     s.messageItemID,
@@ -1416,7 +1544,15 @@ func (s *responsesStreamState) finalizeMessageItem(w io.Writer) error {
 }
 
 func (s *responsesStreamState) finalizeToolCalls(w io.Writer) error {
-	for _, state := range s.activeToolCalls {
+	// Sort tool calls by index to ensure stable output order
+	var indices []int
+	for idx := range s.activeToolCalls {
+		indices = append(indices, idx)
+	}
+	// Simplified sorting (bubble sort) for few items or just iterate.
+	// Actually we just need to iterate and finalize.
+	for _, idx := range indices {
+		state := s.activeToolCalls[idx]
 		if !state.itemAdded || state.done {
 			continue
 		}
@@ -1452,23 +1588,50 @@ func (s *responsesStreamState) finalizeToolCalls(w io.Writer) error {
 }
 
 func (s *responsesStreamState) buildCompletedOutput() []interface{} {
-	var output []interface{}
-	if s.messageItemAdded {
-		text := s.accumulatedText.String()
-		output = append(output, map[string]interface{}{
-			"type":   "message",
-			"id":     s.messageItemID,
-			"role":   "assistant",
-			"status": "completed",
-			"content": []interface{}{
-				map[string]interface{}{
-					"type": "output_text",
-					"text": text,
+	// We need to return items in the same order as their output indices
+	type indexedItem struct {
+		index int
+		item  interface{}
+	}
+	var items []indexedItem
+
+	if s.reasoningItemAdded {
+		items = append(items, indexedItem{
+			index: s.getOutputIndex("reasoning"),
+			item: map[string]interface{}{
+				"id":     s.reasoningItemID,
+				"type":   "reasoning",
+				"status": "completed",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "reasoning_text",
+						"text": s.accumulatedReasoning.String(),
+					},
 				},
 			},
 		})
 	}
-	for _, state := range s.activeToolCalls {
+
+	if s.messageItemAdded {
+		text := s.accumulatedText.String()
+		items = append(items, indexedItem{
+			index: s.getOutputIndex("message"),
+			item: map[string]interface{}{
+				"type":   "message",
+				"id":     s.messageItemID,
+				"role":   "assistant",
+				"status": "completed",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "output_text",
+						"text": text,
+					},
+				},
+			},
+		})
+	}
+
+	for idx, state := range s.activeToolCalls {
 		if !state.itemAdded {
 			continue
 		}
@@ -1483,14 +1646,211 @@ func (s *responsesStreamState) buildCompletedOutput() []interface{} {
 		if state.extraContent != nil {
 			item["extra_content"] = state.extraContent
 		}
-		output = append(output, item)
+		items = append(items, indexedItem{
+			index: s.getOutputIndex(fmt.Sprintf("tool_%d", idx)),
+			item:  item,
+		})
+	}
+
+	// Sort items by index
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if items[i].index > items[j].index {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+
+	var output []interface{}
+	for _, it := range items {
+		output = append(output, it.item)
 	}
 	return output
+}
+
+func (s *responsesStreamState) handleContentDelta(w io.Writer, delta string) error {
+	s.textBuffer += delta
+
+	for {
+		if !s.inReasoning {
+			// Look for <thought>
+			idx := strings.Index(s.textBuffer, "<thought>")
+			if idx != -1 {
+				// Text before <thought> is regular message text
+				prefix := s.textBuffer[:idx]
+				if prefix != "" {
+					if err := s.ensureContentPart(w); err != nil {
+						return err
+					}
+					s.accumulatedText.WriteString(prefix)
+					if err := s.emit(w, "response.output_text.delta", map[string]interface{}{
+						"item_id":       s.messageItemID,
+						"output_index":  s.getOutputIndex("message"),
+						"content_index": 0,
+						"delta":         prefix,
+					}); err != nil {
+						return err
+					}
+				}
+
+				// Transition to reasoning
+				if err := s.ensureReasoningPart(w); err != nil {
+					return err
+				}
+				s.inReasoning = true
+				s.textBuffer = s.textBuffer[idx+len("<thought>"):]
+				continue
+			}
+
+			// No <thought> found. Check for partial <thought> at the end of buffer
+			// To handle cases like "some text <tho"
+			possibleTag := false
+			tag := "<thought>"
+			for i := 1; i < len(tag); i++ {
+				if strings.HasSuffix(s.textBuffer, tag[:i]) {
+					possibleTag = true
+					// We should wait for more data.
+					// Emit the part of the buffer that is definitely not part of the tag.
+					definiteText := s.textBuffer[:len(s.textBuffer)-i]
+					if definiteText != "" {
+						if err := s.ensureContentPart(w); err != nil {
+							return err
+						}
+						s.accumulatedText.WriteString(definiteText)
+						if err := s.emit(w, "response.output_text.delta", map[string]interface{}{
+							"item_id":       s.messageItemID,
+							"output_index":  s.getOutputIndex("message"),
+							"content_index": 0,
+							"delta":         definiteText,
+						}); err != nil {
+							return err
+						}
+						s.textBuffer = s.textBuffer[len(s.textBuffer)-i:]
+					}
+					break
+				}
+			}
+
+			if !possibleTag {
+				// No partial tag, emit all current buffer as message text
+				if s.textBuffer != "" {
+					if err := s.ensureContentPart(w); err != nil {
+						return err
+					}
+					s.accumulatedText.WriteString(s.textBuffer)
+					if err := s.emit(w, "response.output_text.delta", map[string]interface{}{
+						"item_id":       s.messageItemID,
+						"output_index":  s.getOutputIndex("message"),
+						"content_index": 0,
+						"delta":         s.textBuffer,
+					}); err != nil {
+						return err
+					}
+					s.textBuffer = ""
+				}
+			}
+			break
+		} else {
+			// Look for </thought>
+			idx := strings.Index(s.textBuffer, "</thought>")
+			if idx != -1 {
+				// Text before </thought> is reasoning text
+				prefix := s.textBuffer[:idx]
+				if prefix != "" {
+					s.accumulatedReasoning.WriteString(prefix)
+					if err := s.emit(w, "response.reasoning_text.delta", map[string]interface{}{
+						"item_id":       s.reasoningItemID,
+						"output_index":  s.getOutputIndex("reasoning"),
+						"content_index": 0,
+						"delta":         prefix,
+					}); err != nil {
+						return err
+					}
+				}
+
+				// Finalize reasoning
+				if err := s.finalizeReasoningItem(w); err != nil {
+					return err
+				}
+				s.inReasoning = false
+				s.textBuffer = s.textBuffer[idx+len("</thought>"):]
+				continue
+			}
+
+			// No </thought> found. Check for partial </thought> at the end
+			possibleTag := false
+			tag := "</thought>"
+			for i := 1; i < len(tag); i++ {
+				if strings.HasSuffix(s.textBuffer, tag[:i]) {
+					possibleTag = true
+					definiteText := s.textBuffer[:len(s.textBuffer)-i]
+					if definiteText != "" {
+						s.accumulatedReasoning.WriteString(definiteText)
+						if err := s.emit(w, "response.reasoning_text.delta", map[string]interface{}{
+							"item_id":       s.reasoningItemID,
+							"output_index":  s.getOutputIndex("reasoning"),
+							"content_index": 0,
+							"delta":         definiteText,
+						}); err != nil {
+							return err
+						}
+						s.textBuffer = s.textBuffer[len(s.textBuffer)-i:]
+					}
+					break
+				}
+			}
+
+			if !possibleTag {
+				// No partial tag, emit all current buffer as reasoning text
+				if s.textBuffer != "" {
+					s.accumulatedReasoning.WriteString(s.textBuffer)
+					if err := s.emit(w, "response.reasoning_text.delta", map[string]interface{}{
+						"item_id":       s.reasoningItemID,
+						"output_index":  s.getOutputIndex("reasoning"),
+						"content_index": 0,
+						"delta":         s.textBuffer,
+					}); err != nil {
+						return err
+					}
+					s.textBuffer = ""
+				}
+			}
+			break
+		}
+	}
+	return nil
 }
 
 func (s *responsesStreamState) finalize(w io.Writer) error {
 	if !s.responseCreated {
 		return nil
+	}
+	// Emit anything remaining in textBuffer if it didn't complete a tag
+	if s.textBuffer != "" {
+		if s.inReasoning {
+			s.accumulatedReasoning.WriteString(s.textBuffer)
+			_ = s.emit(w, "response.reasoning_text.delta", map[string]interface{}{
+				"item_id":       s.reasoningItemID,
+				"output_index":  s.getOutputIndex("reasoning"),
+				"content_index": 0,
+				"delta":         s.textBuffer,
+			})
+		} else {
+			if err := s.ensureContentPart(w); err == nil {
+				s.accumulatedText.WriteString(s.textBuffer)
+				_ = s.emit(w, "response.output_text.delta", map[string]interface{}{
+					"item_id":       s.messageItemID,
+					"output_index":  s.getOutputIndex("message"),
+					"content_index": 0,
+					"delta":         s.textBuffer,
+				})
+			}
+		}
+		s.textBuffer = ""
+	}
+
+	if err := s.finalizeReasoningItem(w); err != nil {
+		return err
 	}
 	if err := s.finalizeMessageItem(w); err != nil {
 		return err
@@ -1557,16 +1917,7 @@ func TranslateOpenAIStreamToResponses(r io.Reader, w io.Writer, debug bool) erro
 		choice := chunk.Choices[0]
 
 		if choice.Delta.Content != "" {
-			if err := state.ensureContentPart(targetWriter); err != nil {
-				return err
-			}
-			state.accumulatedText.WriteString(choice.Delta.Content)
-			if err := state.emit(targetWriter, "response.output_text.delta", map[string]interface{}{
-				"item_id":       state.messageItemID,
-				"output_index":  state.messageOutputIndex(),
-				"content_index": 0,
-				"delta":         choice.Delta.Content,
-			}); err != nil {
+			if err := state.handleContentDelta(targetWriter, choice.Delta.Content); err != nil {
 				return err
 			}
 		}
