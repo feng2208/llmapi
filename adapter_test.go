@@ -943,13 +943,9 @@ func TestTranslateClaudeRequestToOpenAI_MessagesClaudeContent(t *testing.T) {
 	}
 
 	userMsg := msgs[0].(map[string]interface{})
-	contentParts := userMsg["content"].([]interface{})
-	if len(contentParts) != 1 {
-		t.Fatalf("expected 1 content part, got %v", contentParts)
-	}
-	part := contentParts[0].(map[string]interface{})
-	if part["type"] != "text" || part["text"] != "Hello there" {
-		t.Errorf("invalid part content: %v", part)
+	contentStr, ok := userMsg["content"].(string)
+	if !ok || contentStr != "Hello there" {
+		t.Errorf("expected content to be string 'Hello there', got %v", userMsg["content"])
 	}
 }
 
@@ -994,13 +990,9 @@ func TestTranslateClaudeRequestToOpenAI_ToolResultMixedWithText(t *testing.T) {
 	if m1["role"] != "user" {
 		t.Errorf("expected role user for second message, got %v", m1["role"])
 	}
-	contentParts, ok := m1["content"].([]interface{})
-	if !ok || len(contentParts) != 1 {
-		t.Fatalf("expected 1 content part in user message, got %v", m1["content"])
-	}
-	part := contentParts[0].(map[string]interface{})
-	if part["type"] != "text" || part["text"] != "And here is the answer: " {
-		t.Errorf("invalid part content: %v", part)
+	contentStr, ok := m1["content"].(string)
+	if !ok || contentStr != "And here is the answer: " {
+		t.Errorf("expected content to be string 'And here is the answer: ', got %v", m1["content"])
 	}
 }
 
@@ -1169,6 +1161,184 @@ data: [DONE]
 	}
 	if !strings.Contains(outputStr, "data: [DONE]") {
 		t.Errorf("missing DONE data")
+	}
+}
+
+func TestTranslateOpenAIResponseToClaude_WithThoughts(t *testing.T) {
+	openaiResp := map[string]interface{}{
+		"id":    "chatcmpl-123",
+		"model": "gpt-4o",
+		"choices": []interface{}{
+			map[string]interface{}{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "<thought>I am thinking.</thought>Hello world!",
+				},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]interface{}{
+			"prompt_tokens":     10.0,
+			"completion_tokens": 20.0,
+		},
+	}
+
+	claudeResp, err := TranslateOpenAIResponseToClaude(openaiResp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(claudeResp.Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(claudeResp.Content))
+	}
+
+	block0 := claudeResp.Content[0]
+	if block0.Type != "thinking" || block0.Thinking != "I am thinking." || block0.Signature == "" {
+		t.Errorf("invalid thinking block: %+v", block0)
+	}
+
+	block1 := claudeResp.Content[1]
+	if block1.Type != "text" || block1.Text != "Hello world!" {
+		t.Errorf("invalid text block: %+v", block1)
+	}
+}
+
+func TestTranslateOpenAIStreamToClaude_WithThoughts(t *testing.T) {
+	// Simulate split tags across chunks
+	streamInput := `data: {"id":"chatcmpl-123","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Prefix <tho"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"ught>Thinking</thou"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"ght>Suffix"},"finish_reason":"stop"}]}
+data: [DONE]
+`
+	var outputBuf bytes.Buffer
+	err := TranslateOpenAIStreamToClaude(strings.NewReader(streamInput), &outputBuf, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	outputStr := outputBuf.String()
+
+	// Split by newline and parse events
+	lines := strings.Split(outputStr, "\n")
+	var events []map[string]interface{}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data: ") {
+			dataPayload := strings.TrimPrefix(line, "data: ")
+			var ev map[string]interface{}
+			if err := json.Unmarshal([]byte(dataPayload), &ev); err == nil {
+				events = append(events, ev)
+			}
+		}
+	}
+
+	if len(events) < 13 {
+		t.Fatalf("expected at least 13 events, got %d", len(events))
+	}
+
+	// 1. message_start
+	if events[0]["type"] != "message_start" {
+		t.Errorf("event 0 is not message_start: %v", events[0])
+	}
+
+	// 2. content_block_start (index 0, type "text")
+	ev1 := events[1]
+	if ev1["type"] != "content_block_start" || ev1["index"] != 0.0 {
+		t.Errorf("event 1 invalid: %v", ev1)
+	}
+	cb1 := ev1["content_block"].(map[string]interface{})
+	if cb1["type"] != "text" {
+		t.Errorf("event 1 content_block type invalid: %v", cb1)
+	}
+
+	// 3. content_block_delta (index 0, text "Prefix ")
+	ev2 := events[2]
+	if ev2["type"] != "content_block_delta" || ev2["index"] != 0.0 {
+		t.Errorf("event 2 invalid: %v", ev2)
+	}
+	d2 := ev2["delta"].(map[string]interface{})
+	if d2["type"] != "text_delta" || d2["text"] != "Prefix " {
+		t.Errorf("event 2 delta invalid: %v", d2)
+	}
+
+	// 4. content_block_stop (index 0)
+	ev3 := events[3]
+	if ev3["type"] != "content_block_stop" || ev3["index"] != 0.0 {
+		t.Errorf("event 3 invalid: %v", ev3)
+	}
+
+	// 5. content_block_start (index 1, type "thinking")
+	ev4 := events[4]
+	if ev4["type"] != "content_block_start" || ev4["index"] != 1.0 {
+		t.Errorf("event 4 invalid: %v", ev4)
+	}
+	cb4 := ev4["content_block"].(map[string]interface{})
+	if cb4["type"] != "thinking" || cb4["thinking"] != "" || cb4["signature"] != "" {
+		t.Errorf("event 4 content_block invalid: %v", cb4)
+	}
+
+	// 6. content_block_delta (index 1, thinking "Thinking")
+	ev5 := events[5]
+	if ev5["type"] != "content_block_delta" || ev5["index"] != 1.0 {
+		t.Errorf("event 5 invalid: %v", ev5)
+	}
+	d5 := ev5["delta"].(map[string]interface{})
+	if d5["type"] != "thinking_delta" || d5["thinking"] != "Thinking" {
+		t.Errorf("event 5 delta invalid: %v", d5)
+	}
+
+	// 7. content_block_delta (index 1, signature)
+	ev6 := events[6]
+	if ev6["type"] != "content_block_delta" || ev6["index"] != 1.0 {
+		t.Errorf("event 6 invalid: %v", ev6)
+	}
+	d6 := ev6["delta"].(map[string]interface{})
+	if d6["type"] != "signature_delta" || d6["signature"] != "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds..." {
+		t.Errorf("event 6 delta invalid: %v", d6)
+	}
+
+	// 8. content_block_stop (index 1)
+	ev7 := events[7]
+	if ev7["type"] != "content_block_stop" || ev7["index"] != 1.0 {
+		t.Errorf("event 7 invalid: %v", ev7)
+	}
+
+	// 9. content_block_start (index 2, type "text")
+	ev8 := events[8]
+	if ev8["type"] != "content_block_start" || ev8["index"] != 2.0 {
+		t.Errorf("event 8 invalid: %v", ev8)
+	}
+	cb8 := ev8["content_block"].(map[string]interface{})
+	if cb8["type"] != "text" {
+		t.Errorf("event 8 content_block type invalid: %v", cb8)
+	}
+
+	// 10. content_block_delta (index 2, text "Suffix")
+	ev9 := events[9]
+	if ev9["type"] != "content_block_delta" || ev9["index"] != 2.0 {
+		t.Errorf("event 9 invalid: %v", ev9)
+	}
+	d9 := ev9["delta"].(map[string]interface{})
+	if d9["type"] != "text_delta" || d9["text"] != "Suffix" {
+		t.Errorf("event 9 delta invalid: %v", d9)
+	}
+
+	// 11. content_block_stop (index 2)
+	ev10 := events[10]
+	if ev10["type"] != "content_block_stop" || ev10["index"] != 2.0 {
+		t.Errorf("event 10 invalid: %v", ev10)
+	}
+
+	// 12. message_delta
+	ev11 := events[11]
+	if ev11["type"] != "message_delta" {
+		t.Errorf("event 11 invalid: %v", ev11)
+	}
+
+	// 13. message_stop
+	ev12 := events[12]
+	if ev12["type"] != "message_stop" {
+		t.Errorf("event 12 invalid: %v", ev12)
 	}
 }
 

@@ -24,6 +24,8 @@ type ClaudeContent struct {
 	ToolUseID string             `json:"tool_use_id,omitempty"`
 	Content   interface{}        `json:"content,omitempty"`
 	IsError   *bool              `json:"is_error,omitempty"`
+	Thinking  string             `json:"thinking,omitempty"`
+	Signature string             `json:"signature,omitempty"`
 }
 
 type ClaudeImageSource struct {
@@ -231,6 +233,7 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 			var toolCalls []interface{}
 			var toolResults []map[string]interface{}
 			var textParts []interface{}
+			hasImage := false
 
 			for _, block := range contentVal {
 				blockMap, ok := block.(map[string]interface{})
@@ -246,6 +249,7 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 					})
 					textParts = append(textParts, blockMap["text"])
 				} else if blockType == "image" {
+					hasImage = true
 					if source, ok := blockMap["source"].(map[string]interface{}); ok {
 						mediaType := source["media_type"]
 						data := source["data"]
@@ -299,9 +303,17 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 					openAIMessages = append(openAIMessages, tr)
 				}
 				if len(parts) > 0 {
+					var textContent interface{} = parts
+					if !hasImage {
+						var fullText string
+						for _, tp := range textParts {
+							fullText += fmt.Sprintf("%v", tp)
+						}
+						textContent = fullText
+					}
 					openAIMessages = append(openAIMessages, map[string]interface{}{
 						"role":    msg.Role,
-						"content": parts,
+						"content": textContent,
 					})
 				}
 				continue
@@ -324,7 +336,15 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 			}
 
 			if len(parts) > 0 {
-				openAIContent = parts
+				if !hasImage {
+					var fullText string
+					for _, tp := range textParts {
+						fullText += fmt.Sprintf("%v", tp)
+					}
+					openAIContent = fullText
+				} else {
+					openAIContent = parts
+				}
 			}
 		case []ClaudeContent:
 			var parts []interface{}
@@ -333,6 +353,7 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 			var toolCalls []interface{}
 			var toolResults []map[string]interface{}
 			var textParts []interface{}
+			hasImage := false
 
 			for _, block := range contentVal {
 				blockType := block.Type
@@ -344,6 +365,7 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 					})
 					textParts = append(textParts, block.Text)
 				} else if blockType == "image" {
+					hasImage = true
 					if block.Source != nil {
 						mediaType := block.Source.MediaType
 						data := block.Source.Data
@@ -403,9 +425,17 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 					openAIMessages = append(openAIMessages, tr)
 				}
 				if len(parts) > 0 {
+					var textContent interface{} = parts
+					if !hasImage {
+						var fullText string
+						for _, tp := range textParts {
+							fullText += fmt.Sprintf("%v", tp)
+						}
+						textContent = fullText
+					}
 					openAIMessages = append(openAIMessages, map[string]interface{}{
 						"role":    msg.Role,
-						"content": parts,
+						"content": textContent,
 					})
 				}
 				continue
@@ -428,7 +458,15 @@ func TranslateClaudeRequestToOpenAI(req *ClaudeMessagesRequest) (map[string]inte
 			}
 
 			if len(parts) > 0 {
-				openAIContent = parts
+				if !hasImage {
+					var fullText string
+					for _, tp := range textParts {
+						fullText += fmt.Sprintf("%v", tp)
+					}
+					openAIContent = fullText
+				} else {
+					openAIContent = parts
+				}
 			}
 		}
 
@@ -500,10 +538,27 @@ func TranslateOpenAIResponseToClaude(openaiResp map[string]interface{}) (*Claude
 
 	if val, ok := message["content"]; ok && val != nil {
 		if contentStr, ok := val.(string); ok && contentStr != "" {
-			content = append(content, ClaudeContent{
-				Type: "text",
-				Text: contentStr,
-			})
+			// Extract thought
+			re := regexp.MustCompile(`(?s)<thought>(.*?)</thought>`)
+			match := re.FindStringSubmatch(contentStr)
+			if len(match) > 1 {
+				thoughtText := strings.TrimSpace(match[1])
+				// Remove thought from content
+				contentStr = strings.TrimSpace(re.ReplaceAllString(contentStr, ""))
+
+				content = append(content, ClaudeContent{
+					Type:      "thinking",
+					Thinking:  thoughtText,
+					Signature: "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds...",
+				})
+			}
+
+			if contentStr != "" {
+				content = append(content, ClaudeContent{
+					Type: "text",
+					Text: contentStr,
+				})
+			}
 		}
 	}
 
@@ -983,12 +1038,65 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 
 	messageStarted := false
 	textBlockStarted := false
+	textBlockIdx := -1
+	inThinking := false
+	thinkingBlockStarted := false
+	thinkingBlockIdx := -1
+	textBuffer := ""
 	nextBlockIndex := 0
 	activeToolCalls := make(map[int]int) // OpenAI tc.Index -> Claude block index
 	stopReasonSent := false
-
 	var lastChunkID string
 	var lastChunkModel string
+
+	flushTextBuffer := func() error {
+		if textBuffer == "" {
+			return nil
+		}
+		if inThinking {
+			deltaEvent := map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": thinkingBlockIdx,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": textBuffer,
+				},
+			}
+			if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+				return err
+			}
+		} else {
+			if !textBlockStarted {
+				startBlock := map[string]interface{}{
+					"type":  "content_block_start",
+					"index": nextBlockIndex,
+					"content_block": map[string]interface{}{
+						"type": "text",
+						"text": "",
+					},
+				}
+				if err := writeSSEEvent(targetWriter, "content_block_start", startBlock); err != nil {
+					return err
+				}
+				textBlockStarted = true
+				textBlockIdx = nextBlockIndex
+				nextBlockIndex++
+			}
+			deltaEvent := map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": textBlockIdx,
+				"delta": map[string]interface{}{
+					"type": "text_delta",
+					"text": textBuffer,
+				},
+			}
+			if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+				return err
+			}
+		}
+		textBuffer = ""
+		return nil
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1068,33 +1176,246 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 
 		// 2. Handle Text Delta
 		if choice.Delta.Content != "" {
-			if !textBlockStarted {
-				startBlock := map[string]interface{}{
-					"type":  "content_block_start",
-					"index": nextBlockIndex,
-					"content_block": map[string]interface{}{
-						"type": "text",
-						"text": "",
-					},
-				}
-				if err := writeSSEEvent(targetWriter, "content_block_start", startBlock); err != nil {
-					return err
-				}
-				textBlockStarted = true
-				nextBlockIndex++
-			}
+			textBuffer += choice.Delta.Content
 
-			textBlockIdx := nextBlockIndex - 1 // text block was the last one opened
-			deltaEvent := map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": textBlockIdx,
-				"delta": map[string]interface{}{
-					"type": "text_delta",
-					"text": choice.Delta.Content,
-				},
-			}
-			if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
-				return err
+			for {
+				if !inThinking {
+					// We are looking for <thought>
+					idx := strings.Index(textBuffer, "<thought>")
+					if idx != -1 {
+						// There is text before <thought>. Emit it as text block if non-empty.
+						prefix := textBuffer[:idx]
+						if prefix != "" {
+							if !textBlockStarted {
+								startBlock := map[string]interface{}{
+									"type":  "content_block_start",
+									"index": nextBlockIndex,
+									"content_block": map[string]interface{}{
+										"type": "text",
+										"text": "",
+									},
+								}
+								if err := writeSSEEvent(targetWriter, "content_block_start", startBlock); err != nil {
+									return err
+								}
+								textBlockStarted = true
+								textBlockIdx = nextBlockIndex
+								nextBlockIndex++
+							}
+							deltaEvent := map[string]interface{}{
+								"type":  "content_block_delta",
+								"index": textBlockIdx,
+								"delta": map[string]interface{}{
+									"type": "text_delta",
+									"text": prefix,
+								},
+							}
+							if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+								return err
+							}
+						}
+
+						// If text block is currently active, stop it before starting thinking.
+						if textBlockStarted {
+							stopBlock := map[string]interface{}{
+								"type":  "content_block_stop",
+								"index": textBlockIdx,
+							}
+							if err := writeSSEEvent(targetWriter, "content_block_stop", stopBlock); err != nil {
+								return err
+							}
+							textBlockStarted = false
+							textBlockIdx = -1
+						}
+
+						// Transition to thinking block
+						startBlock := map[string]interface{}{
+							"type":  "content_block_start",
+							"index": nextBlockIndex,
+							"content_block": map[string]interface{}{
+								"type":      "thinking",
+								"thinking":  "",
+								"signature": "",
+							},
+						}
+						if err := writeSSEEvent(targetWriter, "content_block_start", startBlock); err != nil {
+							return err
+						}
+						thinkingBlockStarted = true
+						thinkingBlockIdx = nextBlockIndex
+						inThinking = true
+						nextBlockIndex++
+
+						textBuffer = textBuffer[idx+len("<thought>"):]
+						continue
+					}
+
+					// No <thought> found. Check for partial <thought> at the end of buffer
+					possibleTag := false
+					tag := "<thought>"
+					for i := 1; i < len(tag); i++ {
+						if strings.HasSuffix(textBuffer, tag[:i]) {
+							possibleTag = true
+							definiteText := textBuffer[:len(textBuffer)-i]
+							if definiteText != "" {
+								if !textBlockStarted {
+									startBlock := map[string]interface{}{
+										"type":  "content_block_start",
+										"index": nextBlockIndex,
+										"content_block": map[string]interface{}{
+											"type": "text",
+											"text": "",
+										},
+									}
+									if err := writeSSEEvent(targetWriter, "content_block_start", startBlock); err != nil {
+										return err
+									}
+									textBlockStarted = true
+									textBlockIdx = nextBlockIndex
+									nextBlockIndex++
+								}
+								deltaEvent := map[string]interface{}{
+									"type":  "content_block_delta",
+									"index": textBlockIdx,
+									"delta": map[string]interface{}{
+										"type": "text_delta",
+										"text": definiteText,
+									},
+								}
+								if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+									return err
+								}
+								textBuffer = textBuffer[len(textBuffer)-i:]
+							}
+							break
+						}
+					}
+
+					if !possibleTag {
+						if textBuffer != "" {
+							if !textBlockStarted {
+								startBlock := map[string]interface{}{
+									"type":  "content_block_start",
+									"index": nextBlockIndex,
+									"content_block": map[string]interface{}{
+										"type": "text",
+										"text": "",
+									},
+								}
+								if err := writeSSEEvent(targetWriter, "content_block_start", startBlock); err != nil {
+									return err
+								}
+								textBlockStarted = true
+								textBlockIdx = nextBlockIndex
+								nextBlockIndex++
+							}
+							deltaEvent := map[string]interface{}{
+								"type":  "content_block_delta",
+								"index": textBlockIdx,
+								"delta": map[string]interface{}{
+									"type": "text_delta",
+									"text": textBuffer,
+								},
+							}
+							if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+								return err
+							}
+							textBuffer = ""
+						}
+					}
+					break
+
+				} else {
+					// We are in thinking block. Look for </thought>
+					idx := strings.Index(textBuffer, "</thought>")
+					if idx != -1 {
+						prefix := textBuffer[:idx]
+						if prefix != "" {
+							deltaEvent := map[string]interface{}{
+								"type":  "content_block_delta",
+								"index": thinkingBlockIdx,
+								"delta": map[string]interface{}{
+									"type":     "thinking_delta",
+									"thinking": prefix,
+								},
+							}
+							if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+								return err
+							}
+						}
+
+						// Finalize thinking block: emit signature_delta
+						sigEvent := map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": thinkingBlockIdx,
+							"delta": map[string]interface{}{
+								"type":      "signature_delta",
+								"signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds...",
+							},
+						}
+						if err := writeSSEEvent(targetWriter, "content_block_delta", sigEvent); err != nil {
+							return err
+						}
+
+						// Emit content_block_stop
+						stopBlock := map[string]interface{}{
+							"type":  "content_block_stop",
+							"index": thinkingBlockIdx,
+						}
+						if err := writeSSEEvent(targetWriter, "content_block_stop", stopBlock); err != nil {
+							return err
+						}
+						thinkingBlockStarted = false
+						thinkingBlockIdx = -1
+						inThinking = false
+
+						textBuffer = textBuffer[idx+len("</thought>"):]
+						continue
+					}
+
+					// Check for partial </thought> at the end of buffer
+					possibleTag := false
+					tag := "</thought>"
+					for i := 1; i < len(tag); i++ {
+						if strings.HasSuffix(textBuffer, tag[:i]) {
+							possibleTag = true
+							definiteText := textBuffer[:len(textBuffer)-i]
+							if definiteText != "" {
+								deltaEvent := map[string]interface{}{
+									"type":  "content_block_delta",
+									"index": thinkingBlockIdx,
+									"delta": map[string]interface{}{
+										"type":     "thinking_delta",
+										"thinking": definiteText,
+									},
+								}
+								if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+									return err
+								}
+								textBuffer = textBuffer[len(textBuffer)-i:]
+							}
+							break
+						}
+					}
+
+					if !possibleTag {
+						if textBuffer != "" {
+							deltaEvent := map[string]interface{}{
+								"type":  "content_block_delta",
+								"index": thinkingBlockIdx,
+								"delta": map[string]interface{}{
+									"type":     "thinking_delta",
+									"thinking": textBuffer,
+								},
+							}
+							if err := writeSSEEvent(targetWriter, "content_block_delta", deltaEvent); err != nil {
+								return err
+							}
+							textBuffer = ""
+						}
+					}
+					break
+				}
 			}
 		}
 
@@ -1140,21 +1461,34 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 
 		// 4. Handle finish reason
 		if choice.FinishReason != "" {
-			if textBlockStarted {
-				textBlockIdx := 0 // text block is always index 0 when it exists
-				for i := 0; i < nextBlockIndex; i++ {
-					isToolBlock := false
-					for _, bi := range activeToolCalls {
-						if bi == i {
-							isToolBlock = true
-							break
-						}
-					}
-					if !isToolBlock {
-						textBlockIdx = i
-						break
-					}
+			if err := flushTextBuffer(); err != nil {
+				return err
+			}
+
+			if thinkingBlockStarted {
+				sigEvent := map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": thinkingBlockIdx,
+					"delta": map[string]interface{}{
+						"type":      "signature_delta",
+						"signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds...",
+					},
 				}
+				if err := writeSSEEvent(targetWriter, "content_block_delta", sigEvent); err != nil {
+					return err
+				}
+
+				stopBlock := map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": thinkingBlockIdx,
+				}
+				if err := writeSSEEvent(targetWriter, "content_block_stop", stopBlock); err != nil {
+					return err
+				}
+				thinkingBlockStarted = false
+			}
+
+			if textBlockStarted {
 				stopBlock := map[string]interface{}{
 					"type":  "content_block_stop",
 					"index": textBlockIdx,
@@ -1209,6 +1543,37 @@ func TranslateOpenAIStreamToClaude(r io.Reader, w io.Writer, debug bool) error {
 		if hasFlush {
 			flusher.Flush()
 		}
+	}
+
+	// Flush any remaining buffered text and close active blocks
+	_ = flushTextBuffer()
+
+	if thinkingBlockStarted {
+		sigEvent := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": thinkingBlockIdx,
+			"delta": map[string]interface{}{
+				"type":      "signature_delta",
+				"signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds...",
+			},
+		}
+		_ = writeSSEEvent(targetWriter, "content_block_delta", sigEvent)
+
+		stopBlock := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": thinkingBlockIdx,
+		}
+		_ = writeSSEEvent(targetWriter, "content_block_stop", stopBlock)
+		thinkingBlockStarted = false
+	}
+
+	if textBlockStarted {
+		stopBlock := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": textBlockIdx,
+		}
+		_ = writeSSEEvent(targetWriter, "content_block_stop", stopBlock)
+		textBlockStarted = false
 	}
 
 	// Close the message cleanly
