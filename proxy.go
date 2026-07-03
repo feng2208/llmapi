@@ -533,7 +533,7 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 
-	if requestType != "openai" && resp.Header.Get("Content-Encoding") == "gzip" {
+	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gzipReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			log.Printf("failed to create gzip reader: %v", err)
@@ -542,6 +542,8 @@ func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request
 		}
 		defer gzipReader.Close()
 		resp.Body = gzipReader
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
 	}
 
 	if debug {
