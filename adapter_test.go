@@ -1342,3 +1342,87 @@ data: [DONE]
 	}
 }
 
+func TestTranslateResponsesRequestToOpenAI_NamespaceTools(t *testing.T) {
+	req := &OpenAIResponsesRequest{
+		Model: "gemini-flash-lite",
+		Input: []interface{}{
+			map[string]interface{}{
+				"role":    "user",
+				"content": "Spawn some agents",
+			},
+		},
+		Tools: []interface{}{
+			map[string]interface{}{
+				"type": "namespace",
+				"tools": []interface{}{
+					map[string]interface{}{
+						"type":        "function",
+						"name":        "close_agent",
+						"description": "Close an agent ...",
+						"strict":      false,
+						"parameters": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"target": map[string]interface{}{
+									"type":        "string",
+									"description": "Agent id to close (from spawn_agent).",
+								},
+							},
+							"required": []interface{}{"target"},
+							"additionalProperties": false,
+						},
+					},
+					map[string]interface{}{
+						"type":        "function",
+						"name":        "wait_agent",
+						"description": "Wait for agents ...",
+						"strict":      false,
+						"parameters": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"targets": map[string]interface{}{
+									"type":        "array",
+									"description": "Agent ids to wait on.",
+									"items": map[string]interface{}{
+										"type": "string",
+									},
+								},
+							},
+							"required": []interface{}{"targets"},
+							"additionalProperties": false,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	openaiReq, err := TranslateResponsesRequestToOpenAI(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tools, ok := openaiReq["tools"].([]interface{})
+	if !ok || len(tools) != 2 {
+		t.Fatalf("expected 2 converted tools, got %v", openaiReq["tools"])
+	}
+
+	t1 := tools[0].(map[string]interface{})
+	if t1["type"] != "function" {
+		t.Errorf("expected tool type function, got %v", t1["type"])
+	}
+	f1 := t1["function"].(map[string]interface{})
+	if f1["name"] != "close_agent" || f1["description"] != "Close an agent ..." {
+		t.Errorf("invalid converted function: %v", f1)
+	}
+
+	t2 := tools[1].(map[string]interface{})
+	if t2["type"] != "function" {
+		t.Errorf("expected tool type function, got %v", t2["type"])
+	}
+	f2 := t2["function"].(map[string]interface{})
+	if f2["name"] != "wait_agent" || f2["description"] != "Wait for agents ..." {
+		t.Errorf("invalid converted function: %v", f2)
+	}
+}
+

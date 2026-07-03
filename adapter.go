@@ -808,36 +808,7 @@ func TranslateResponsesRequestToOpenAI(req *OpenAIResponsesRequest) (map[string]
 	}
 
 	if len(req.Tools) > 0 {
-		var chatTools []interface{}
-		for _, tool := range req.Tools {
-			toolMap, ok := tool.(map[string]interface{})
-			if !ok {
-				chatTools = append(chatTools, tool)
-				continue
-			}
-			toolType := fmt.Sprintf("%v", toolMap["type"])
-			if toolType == "function" {
-				// Responses API flat format -> Chat Completions nested format
-				fnDef := map[string]interface{}{}
-				if name, ok := toolMap["name"]; ok {
-					fnDef["name"] = sanitizeToolName(fmt.Sprintf("%v", name))
-				}
-				if desc, ok := toolMap["description"]; ok {
-					fnDef["description"] = desc
-				}
-				if params, ok := toolMap["parameters"]; ok {
-					fnDef["parameters"] = params
-				}
-				if strict, ok := toolMap["strict"]; ok {
-					fnDef["strict"] = strict
-				}
-				chatTools = append(chatTools, map[string]interface{}{
-					"type":     "function",
-					"function": fnDef,
-				})
-			}
-		}
-		openaiReq["tools"] = chatTools
+		openaiReq["tools"] = convertResponsesTools(req.Tools)
 	}
 	if req.Temperature != nil {
 		openaiReq["temperature"] = *req.Temperature
@@ -853,6 +824,47 @@ func TranslateResponsesRequestToOpenAI(req *OpenAIResponsesRequest) (map[string]
 	}
 
 	return openaiReq, nil
+}
+
+// convertResponsesTools recursively converts Responses API tool formats (including namespace) to Chat Completions tool formats.
+func convertResponsesTools(tools []interface{}) []interface{} {
+	var chatTools []interface{}
+	for _, tool := range tools {
+		toolMap, ok := tool.(map[string]interface{})
+		if !ok {
+			chatTools = append(chatTools, tool)
+			continue
+		}
+		toolType := fmt.Sprintf("%v", toolMap["type"])
+		if toolType == "namespace" {
+			if subToolsVal, ok := toolMap["tools"]; ok {
+				if subToolsSlice, ok := subToolsVal.([]interface{}); ok {
+					chatTools = append(chatTools, convertResponsesTools(subToolsSlice)...)
+				}
+			}
+		} else if toolType == "function" {
+			fnDef := map[string]interface{}{}
+			if name, ok := toolMap["name"]; ok {
+				fnDef["name"] = sanitizeToolName(fmt.Sprintf("%v", name))
+			}
+			if desc, ok := toolMap["description"]; ok {
+				fnDef["description"] = desc
+			}
+			if params, ok := toolMap["parameters"]; ok {
+				fnDef["parameters"] = params
+			}
+			if strict, ok := toolMap["strict"]; ok {
+				fnDef["strict"] = strict
+			}
+			chatTools = append(chatTools, map[string]interface{}{
+				"type":     "function",
+				"function": fnDef,
+			})
+			//} else {
+			//	chatTools = append(chatTools, tool)
+		}
+	}
+	return chatTools
 }
 
 // TranslateOpenAIResponseToResponses converts OpenAI Chat Completions Response to Responses API Response.
@@ -1672,7 +1684,7 @@ type responsesStreamState struct {
 	messageItemDone      bool
 	reasoningItemAdded   bool
 	reasoningPartAdded   bool
-	reasoningItemID     string
+	reasoningItemID      string
 	accumulatedReasoning strings.Builder
 	reasoningItemDone    bool
 	inReasoning          bool
