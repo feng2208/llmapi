@@ -1,0 +1,45 @@
+listen: "0.0.0.0:3000"
+max_body_size: 10485760  # 10MB, 0 means no limit
+
+# Global proxy (optional)
+proxy: socks5://127.0.0.1:1080
+#proxy: http://127.0.0.1:8080
+
+clients:
+  rate_limit: 10
+  auth:
+    - name: mykey
+      key: sk-wxfoeeeeeeeeeeeeeeeeeeee
+      rate_limit: 20
+    - name: mykey2
+      key: sk-wxfouuuuuuuuuuuuuuuu2
+
+
+models:
+  - name: gemini-flash-lite
+    providers:
+      - name: gemini
+        upstream: https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+        model: gemini-2.5-flash-lite
+        rate_limit: 10
+        timeout: 120s
+        proxy: socks5://127.0.0.1:1080
+        reasoning_start: "<thought>"
+        reasoning_end: "</thought>"
+        request_body:
+          delete:
+            - reasoning_effort
+          extra:
+            - extra_body:
+                google:
+                  thinking_config:
+                    thinking_level: high
+                    include_thoughts: true
+        
+
+
+providers:
+  - name: gemini
+    rate_limit: 10
+    auth_keys:
+      - AIaaaaaaaaaaaaaaaaaaaa
