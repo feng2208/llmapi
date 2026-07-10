@@ -30,8 +30,8 @@ type ClientAuth struct {
 }
 
 type ModelConfig struct {
-	Name      string                 `yaml:"name"`
-	Providers []ModelProviderConfig  `yaml:"providers"`
+	Name      string                `yaml:"name"`
+	Providers []ModelProviderConfig `yaml:"providers"`
 }
 
 type ModelProviderConfig struct {
@@ -60,11 +60,11 @@ type ProviderConf struct {
 // Timeout parses Duration from ModelProviderConfig.TimeoutStr.
 func (mpc *ModelProviderConfig) Timeout() time.Duration {
 	if mpc.TimeoutStr == "" {
-		return 120 * time.Second // Default timeout as per template (or 120s)
+		return 300 * time.Second // Default timeout 5 min
 	}
 	d, err := time.ParseDuration(mpc.TimeoutStr)
 	if err != nil {
-		return 120 * time.Second
+		return 300 * time.Second
 	}
 	return d
 }

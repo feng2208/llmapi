@@ -196,78 +196,91 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			return
 		}
 
-		// 5. Select Route (Model/Provider/AuthKey)
-		route, err := router.SelectRoute(modelName)
-		if err != nil {
-			fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
-			http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
-			return
-		}
+		// 5-9. Select route, build request, execute with retry on 429/500/503
+		const maxRetries = 2
+		var route *SelectedRoute
+		var resp *http.Response
 
-		// 6. Modify request body
-		modifiedBody, err := ModifyRequestBody(rawBody, route)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to modify request body: %s"}}`, err.Error()), http.StatusInternalServerError)
-			return
-		}
-
-		// 7. Build Upstream Request
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", route.ModelProvider.Upstream, bytes.NewReader(modifiedBody))
-		if err != nil {
-			http.Error(w, `{"error": {"message": "Failed to build upstream request"}}`, http.StatusInternalServerError)
-			return
-		}
-
-		// Copy request headers
-		for k, vv := range r.Header {
-			// Do not copy host, content-length, or accept-encoding to prevent compression
-			if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" {
-				continue
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			// 5. Select Route (Model/Provider/AuthKey)
+			var err error
+			route, err = router.SelectRoute(modelName)
+			if err != nil {
+				fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
+				http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
+				return
 			}
-			for _, v := range vv {
-				upstreamReq.Header.Add(k, v)
+
+			// 6. Modify request body
+			modifiedBody, err := ModifyRequestBody(rawBody, route)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to modify request body: %s"}}`, err.Error()), http.StatusInternalServerError)
+				return
 			}
-		}
 
-		// Swap Authorization with chosen upstream auth key
-		upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
-		upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
+			// 7. Build Upstream Request
+			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", route.ModelProvider.Upstream, bytes.NewReader(modifiedBody))
+			if err != nil {
+				http.Error(w, `{"error": {"message": "Failed to build upstream request"}}`, http.StatusInternalServerError)
+				return
+			}
 
-		if debug {
-			fmt.Printf("[DEBUG] --- OUTGOING REQUEST ---\n")
-			fmt.Printf("[DEBUG] Target URL: %s\n", upstreamReq.URL.String())
-			for k, vv := range upstreamReq.Header {
+			// Copy request headers
+			for k, vv := range r.Header {
+				// Do not copy host, content-length, or accept-encoding to prevent compression
+				if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" {
+					continue
+				}
 				for _, v := range vv {
-					fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
+					upstreamReq.Header.Add(k, v)
 				}
 			}
-			fmt.Printf("[DEBUG] Body: %s\n", string(modifiedBody))
-		}
 
-		// 8. Execute Upstream Request
-		client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to configure proxy client: %s"}}`, err.Error()), http.StatusInternalServerError)
-			return
-		}
+			// Swap Authorization with chosen upstream auth key
+			upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
+			upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
 
-		resp, err := client.Do(upstreamReq)
-		if err != nil {
-			elapsed := time.Since(startTime)
-			fmt.Printf("[ERROR] Model=%s Provider=%s Key[%d] 502 %s Error: %v\n",
-				modelName, route.ModelProvider.Name, route.KeyIndex, elapsed, err)
-			http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, err.Error()), http.StatusBadGateway)
-			return
+			if debug {
+				fmt.Printf("[DEBUG] --- OUTGOING REQUEST (attempt %d/%d) ---\n", attempt+1, maxRetries+1)
+				fmt.Printf("[DEBUG] Target URL: %s\n", upstreamReq.URL.String())
+				for k, vv := range upstreamReq.Header {
+					for _, v := range vv {
+						fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
+					}
+				}
+				fmt.Printf("[DEBUG] Body: %s\n", string(modifiedBody))
+			}
+
+			// 8. Execute Upstream Request
+			client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to configure proxy client: %s"}}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+
+			resp, err = client.Do(upstreamReq)
+			if err != nil {
+				elapsed := time.Since(startTime)
+				fmt.Printf("[ERROR] Model=%s Provider=%s Key[%d] 502 %s Error: %v\n",
+					modelName, route.ModelProvider.Name, route.KeyIndex, elapsed, err)
+				http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, err.Error()), http.StatusBadGateway)
+				return
+			}
+
+			// 9. Record state status
+			stateMgr.RecordUpstreamResult(route.AuthKey, resp.StatusCode)
+
+			// Check if retry is needed for retryable status codes
+			if (resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503) && attempt < maxRetries {
+				resp.Body.Close()
+				fmt.Printf("[WARN] Upstream (key[%d]) returned %d, retrying with next key (attempt %d/%d)\n",
+					route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
+				startTime = time.Now()
+				continue
+			}
+			break
 		}
 		defer resp.Body.Close()
-
-		// 9. Record state status
-		stateMgr.RecordUpstreamResult(route.AuthKey, resp.StatusCode)
-
-		// Access logging in terminal:
-		elapsed := time.Since(startTime)
-		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s\n",
-			time.Now().Format("2006-01-02 15:04:05.000"), modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 
 		if debug {
 			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE ---\n")
@@ -331,5 +344,10 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			w.WriteHeader(resp.StatusCode)
 			_, _ = writer.Write(modified)
 		}
+
+		// Access logging
+		elapsed := time.Since(startTime)
+		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s\n",
+			time.Now().Format("2006-01-02 15:04:05.000"), modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 	}
 }
