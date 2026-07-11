@@ -2,7 +2,7 @@ package main
 
 import (
 	"errors"
-	"sync"
+	"math/rand"
 )
 
 type SelectedRoute struct {
@@ -12,17 +12,14 @@ type SelectedRoute struct {
 }
 
 type Router struct {
-	cfg       *Config
-	state     *StateManager
-	mu        sync.Mutex
-	rrCursors map[string]int // key is provider name, value is last used index
+	cfg   *Config
+	state *StateManager
 }
 
 func NewRouter(cfg *Config, state *StateManager) *Router {
 	return &Router{
-		cfg:       cfg,
-		state:     state,
-		rrCursors: make(map[string]int),
+		cfg:   cfg,
+		state: state,
 	}
 }
 
@@ -68,17 +65,13 @@ func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
 
 		numKeys := len(providerConf.AuthKeys)
 
-		r.mu.Lock()
-		cursor := r.rrCursors[providerConf.Name]
-		r.mu.Unlock()
-
-		// Attempt to find an available key using round-robin starting from cursor+1
+		// Generate a random permutation of indices (shuffled array from 0 to numKeys-1)
+		indices := rand.Perm(numKeys)
 		found := false
 		var selectedKey string
 		var selectedIndex int
 
-		for k := 1; k <= numKeys; k++ {
-			idx := (cursor + k) % numKeys
+		for _, idx := range indices {
 			key := providerConf.AuthKeys[idx]
 
 			// Check 429 lock status
@@ -105,11 +98,6 @@ func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
 				selectedKey = key
 				selectedIndex = idx
 				found = true
-
-				// Update cursor
-				r.mu.Lock()
-				r.rrCursors[providerConf.Name] = idx
-				r.mu.Unlock()
 				break
 			}
 		}

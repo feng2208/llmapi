@@ -142,7 +142,7 @@ func TestRouter(t *testing.T) {
 	sm := NewStateManager()
 	router := NewRouter(cfg, sm)
 
-	// Step 3a: Select route first time.
+	// Step 3a: Select route first time. It should pick a valid key of prov-1.
 	route, err := router.SelectRoute("test-model")
 	if err != nil {
 		t.Fatalf("Failed to select route: %v", err)
@@ -150,9 +150,11 @@ func TestRouter(t *testing.T) {
 	if route.ModelProvider.Name != "prov-1" {
 		t.Errorf("Expected prov-1, got %s", route.ModelProvider.Name)
 	}
-	firstKey := route.AuthKey
+	if route.AuthKey != "key-1-a" && route.AuthKey != "key-1-b" {
+		t.Errorf("Expected route.AuthKey to be either key-1-a or key-1-b, got %s", route.AuthKey)
+	}
 
-	// Step 3b: Select route second time. It should round-robin to the other key of prov-1.
+	// Step 3b: Select route second time. Since it is random, it should still pick a valid key of prov-1.
 	route2, err := router.SelectRoute("test-model")
 	if err != nil {
 		t.Fatalf("Failed to select route second time: %v", err)
@@ -160,8 +162,8 @@ func TestRouter(t *testing.T) {
 	if route2.ModelProvider.Name != "prov-1" {
 		t.Errorf("Expected prov-1, got %s", route2.ModelProvider.Name)
 	}
-	if route2.AuthKey == firstKey {
-		t.Errorf("Expected different key for round-robin, both were %s", firstKey)
+	if route2.AuthKey != "key-1-a" && route2.AuthKey != "key-1-b" {
+		t.Errorf("Expected route2.AuthKey to be either key-1-a or key-1-b, got %s", route2.AuthKey)
 	}
 
 	// Step 3c: Disable all keys of prov-1 (simulate lock)
