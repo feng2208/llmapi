@@ -180,7 +180,11 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 					fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
 				}
 			}
-			fmt.Printf("[DEBUG] Body: %s\n", string(rawBody))
+			bodyStr := string(rawBody)
+			if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+				bodyStr = FormatJSON(rawBody)
+			}
+			fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
 		}
 
 		// 4. Parse request JSON to get model
@@ -248,7 +252,11 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 						fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
 					}
 				}
-				fmt.Printf("[DEBUG] Body: %s\n", string(modifiedBody))
+				bodyStr := string(modifiedBody)
+				if strings.HasPrefix(upstreamReq.Header.Get("Content-Type"), "application/json") {
+					bodyStr = FormatJSON(modifiedBody)
+				}
+				fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
 			}
 
 			// 8. Execute Upstream Request
@@ -307,8 +315,10 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 
 		// 11. Process and stream response body
 		var respBody io.Reader = resp.Body
-		if debug {
-			respBody = loggingReader{r: resp.Body}
+		// Wrap with loggingReader only for SSE (streaming) responses.
+		// For non-SSE JSON, we will print the formatted response body at the end.
+		if debug && isSSE {
+			respBody = &loggingReader{r: resp.Body}
 		}
 
 		var writer io.Writer = w
@@ -340,6 +350,16 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 				fmt.Printf("[WARN] Upstream returned HTTP 400. Response body:\n%s\n", string(rawResp))
 			}
 			modified := ProcessJSONResponse(rawResp, route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
+
+			if debug {
+				respContentType := resp.Header.Get("Content-Type")
+				bodyStr := string(modified)
+				if strings.HasPrefix(respContentType, "application/json") {
+					bodyStr = FormatJSON(modified)
+				}
+				fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY ---\n%s\n", bodyStr)
+			}
+
 			w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
 			w.WriteHeader(resp.StatusCode)
 			_, _ = writer.Write(modified)
