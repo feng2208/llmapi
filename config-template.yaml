@@ -36,6 +36,23 @@ models:
                     thinking_level: high
                     include_thoughts: true
         
+      - name: vertex
+        upstream: https://aiplatform.googleapis.com/v1/publishers/google/models/
+        model: gemini-2.5-flash-lite
+        rate_limit: 10
+        timeout: 120s
+        proxy: socks5://127.0.0.1:1080
+        api_type: gemini
+        request_body:
+          extra:
+            - tools:
+                - google_search: {}
+            - toolConfig:
+                includeServerSideToolInvocations: true
+            - generationConfig:
+                thinkingConfig:
+                  includeThoughts: true
+                  thinkingLevel: HIGH
 
 
 providers:

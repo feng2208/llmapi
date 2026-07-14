@@ -223,7 +223,28 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			}
 
 			// 7. Build Upstream Request
-			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", route.ModelProvider.Upstream, bytes.NewReader(modifiedBody))
+			targetURL := route.ModelProvider.Upstream
+			if route.ModelProvider.ApiType == "gemini" {
+				isStream, _ := reqJSON["stream"].(bool)
+				u := targetURL
+				if !strings.HasSuffix(u, "/") {
+					u += "/"
+				}
+				u += route.ModelProvider.Model
+				if isStream {
+					u += ":streamGenerateContent"
+					if !strings.Contains(u, "?") {
+						u += "?alt=sse"
+					} else {
+						u += "&alt=sse"
+					}
+				} else {
+					u += ":generateContent"
+				}
+				targetURL = u
+			}
+
+			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(modifiedBody))
 			if err != nil {
 				http.Error(w, `{"error": {"message": "Failed to build upstream request"}}`, http.StatusInternalServerError)
 				return
@@ -241,7 +262,12 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			}
 
 			// Swap Authorization with chosen upstream auth key
-			upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
+			if route.ModelProvider.ApiType == "gemini" {
+				upstreamReq.Header.Set("x-goog-api-key", route.AuthKey)
+				upstreamReq.Header.Del("Authorization")
+			} else {
+				upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
+			}
 			upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
 
 			if debug {
@@ -308,8 +334,20 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			if !isSSE && k == "Content-Length" {
 				continue
 			}
+			// Skip Content-Type and other Gemini specific headers that we will overwrite
+			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || k == "Content-Length" || strings.HasPrefix(k, "X-Goog-")) {
+				continue
+			}
 			for _, v := range vv {
 				w.Header().Add(k, v)
+			}
+		}
+
+		if route.ModelProvider.ApiType == "gemini" {
+			if isSSE {
+				w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			} else {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			}
 		}
 
@@ -329,15 +367,32 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 		if isSSE {
 			w.WriteHeader(resp.StatusCode)
 			reader := bufio.NewReader(respBody)
-			extractor := NewStreamExtractor(route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
-			for {
-				line, err := reader.ReadBytes('\n')
-				if len(line) > 0 {
-					modifiedLine := extractor.ProcessSSELine(line)
-					_, _ = writer.Write(modifiedLine)
+			if route.ModelProvider.ApiType == "gemini" {
+				genID := fmt.Sprintf("chatcmpl-%s", generateRandomString(12))
+				createdTime := time.Now().Unix()
+				for {
+					line, err := reader.ReadBytes('\n')
+					if len(line) > 0 {
+						modifiedLine := ProcessGeminiSSELine(line, genID, createdTime, route.ModelProvider.Model)
+						if modifiedLine != nil {
+							_, _ = writer.Write(modifiedLine)
+						}
+					}
+					if err != nil {
+						break
+					}
 				}
-				if err != nil {
-					break
+			} else {
+				extractor := NewStreamExtractor(route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
+				for {
+					line, err := reader.ReadBytes('\n')
+					if len(line) > 0 {
+						modifiedLine := extractor.ProcessSSELine(line)
+						_, _ = writer.Write(modifiedLine)
+					}
+					if err != nil {
+						break
+					}
 				}
 			}
 		} else {
@@ -349,15 +404,24 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			if resp.StatusCode == 400 {
 				fmt.Printf("[WARN] Upstream returned HTTP 400. Response body:\n%s\n", string(rawResp))
 			}
-			modified := ProcessJSONResponse(rawResp, route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
+			var modified []byte
+			if route.ModelProvider.ApiType == "gemini" {
+				modified, err = ProcessGeminiJSONResponse(rawResp, route.ModelProvider.Model)
+				if err != nil {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+			} else {
+				modified = ProcessJSONResponse(rawResp, route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
+			}
 
 			if debug {
-				respContentType := resp.Header.Get("Content-Type")
-				bodyStr := string(modified)
-				if strings.HasPrefix(respContentType, "application/json") {
-					bodyStr = FormatJSON(modified)
+				upstreamContentType := resp.Header.Get("Content-Type")
+				bodyStr := string(rawResp)
+				if strings.HasPrefix(upstreamContentType, "application/json") {
+					bodyStr = FormatJSON(rawResp)
 				}
-				fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY ---\n%s\n", bodyStr)
+				fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
 			}
 
 			w.Header().Set("Content-Length", strconv.Itoa(len(modified)))

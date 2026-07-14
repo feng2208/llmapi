@@ -44,6 +44,7 @@ type ModelProviderConfig struct {
 	ReasoningStart string            `yaml:"reasoning_start"`
 	ReasoningEnd   string            `yaml:"reasoning_end"`
 	RequestBody    RequestBodyConfig `yaml:"request_body"`
+	ApiType        string            `yaml:"api_type"`
 }
 
 type RequestBodyConfig struct {
