@@ -47,8 +47,6 @@ models:
           extra:
             - tools:
                 - google_search: {}
-            - toolConfig:
-                includeServerSideToolInvocations: true
             - generationConfig:
                 thinkingConfig:
                   includeThoughts: true
@@ -60,3 +58,8 @@ providers:
     rate_limit: 10
     auth_keys:
       - AIaaaaaaaaaaaaaaaaaaaa
+
+  - name: vertex
+    rate_limit: 10
+    auth_keys:
+      - AIaabbbbbbbbbbbbbbbbbbbbbb
