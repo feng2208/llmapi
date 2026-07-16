@@ -110,128 +110,155 @@ func handleModels(cfg *Config) http.HandlerFunc {
 	}
 }
 
-func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
+type handlerCtx struct {
+	clientKey     string
+	matchedClient *ClientAuth
+	rawBody       []byte
+	reqJSON       map[string]interface{}
+	modelName     string
+}
 
-		if r.Method != http.MethodPost {
-			http.Error(w, `{"error": {"message": "Method not allowed"}}`, http.StatusMethodNotAllowed)
-			return
+func executeUpstreamRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	cfg *Config,
+	stateMgr *StateManager,
+	router *Router,
+	proxyMgr *ProxyManager,
+	bodyModifier func(rawBody []byte, route *SelectedRoute) ([]byte, error),
+) (*SelectedRoute, *http.Response, *handlerCtx, time.Time, bool) {
+	startTime := time.Now()
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": {"message": "Method not allowed"}}`, http.StatusMethodNotAllowed)
+		return nil, nil, nil, startTime, false
+	}
+
+	fmt.Printf("[INFO] [%s] %s request started ...\n", time.Now().Format("2006-01-02 15:04:05.000"), r.URL.Path)
+
+	// 1. Authenticate Client
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) < 8 || authHeader[:7] != "Bearer " {
+		fmt.Printf("[WARN] Client authentication failed: Missing or invalid Authorization header\n")
+		http.Error(w, `{"error": {"message": "Missing or invalid Authorization header", "type": "invalid_request_error"}}`, http.StatusUnauthorized)
+		return nil, nil, nil, startTime, false
+	}
+	clientKey := authHeader[7:]
+
+	var matchedClient *ClientAuth
+	for i := range cfg.Clients.Auth {
+		if cfg.Clients.Auth[i].Key == clientKey {
+			matchedClient = &cfg.Clients.Auth[i]
+			break
 		}
+	}
 
-		fmt.Printf("[INFO] [%s] /v1/chat/completions request started ...\n", time.Now().Format("2006-01-02 15:04:05.000"))
+	if matchedClient == nil {
+		fmt.Printf("[WARN] Client authentication failed: Key not authorized\n")
+		http.Error(w, `{"error": {"message": "Invalid client auth key", "type": "invalid_request_error"}}`, http.StatusUnauthorized)
+		return nil, nil, nil, startTime, false
+	}
 
-		// 1. Authenticate Client
-		authHeader := r.Header.Get("Authorization")
-		if len(authHeader) < 8 || authHeader[:7] != "Bearer " {
-			fmt.Printf("[WARN] Client authentication failed: Missing or invalid Authorization header\n")
-			http.Error(w, `{"error": {"message": "Missing or invalid Authorization header", "type": "invalid_request_error"}}`, http.StatusUnauthorized)
-			return
-		}
-		clientKey := authHeader[7:]
+	// 2. Client Rate Limiting
+	limit := cfg.Clients.RateLimit
+	if matchedClient.RateLimit > 0 {
+		limit = matchedClient.RateLimit
+	}
 
-		var matchedClient *ClientAuth
-		for i := range cfg.Clients.Auth {
-			if cfg.Clients.Auth[i].Key == clientKey {
-				matchedClient = &cfg.Clients.Auth[i]
-				break
+	if !stateMgr.AllowClient(clientKey, limit) {
+		fmt.Printf("[WARN] Client %q rate limit exceeded\n", matchedClient.Name)
+		http.Error(w, `{"error": {"message": "Client rate limit exceeded", "type": "rate_limit_error"}}`, http.StatusTooManyRequests)
+		return nil, nil, nil, startTime, false
+	}
+
+	// 3. Read request body within MaxBodySize limits
+	var bodyReader io.Reader = r.Body
+	if cfg.MaxBodySize > 0 {
+		bodyReader = io.LimitReader(r.Body, cfg.MaxBodySize+1)
+	}
+
+	rawBody, err := io.ReadAll(bodyReader)
+	if err != nil {
+		http.Error(w, `{"error": {"message": "Failed to read request body"}}`, http.StatusInternalServerError)
+		return nil, nil, nil, startTime, false
+	}
+
+	if cfg.MaxBodySize > 0 && int64(len(rawBody)) > cfg.MaxBodySize {
+		http.Error(w, `{"error": {"message": "Request body too large", "type": "invalid_request_error"}}`, http.StatusRequestEntityTooLarge)
+		return nil, nil, nil, startTime, false
+	}
+
+	if debug {
+		fmt.Printf("[DEBUG] --- INCOMING REQUEST ---\n")
+		fmt.Printf("[DEBUG] URL: %s %s\n", r.Method, r.URL.String())
+		for k, vv := range r.Header {
+			for _, v := range vv {
+				fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
 			}
 		}
-
-		if matchedClient == nil {
-			fmt.Printf("[WARN] Client authentication failed: Key not authorized\n")
-			http.Error(w, `{"error": {"message": "Invalid client auth key", "type": "invalid_request_error"}}`, http.StatusUnauthorized)
-			return
+		bodyStr := string(rawBody)
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			bodyStr = FormatJSON(rawBody)
 		}
+		fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
+	}
 
-		// 2. Client Rate Limiting
-		limit := cfg.Clients.RateLimit
-		if matchedClient.RateLimit > 0 {
-			limit = matchedClient.RateLimit
-		}
+	// 4. Parse request JSON to get model
+	var reqJSON map[string]interface{}
+	if err := json.Unmarshal(rawBody, &reqJSON); err != nil {
+		http.Error(w, `{"error": {"message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
+		return nil, nil, nil, startTime, false
+	}
 
-		if !stateMgr.AllowClient(clientKey, limit) {
-			fmt.Printf("[WARN] Client %q rate limit exceeded\n", matchedClient.Name)
-			http.Error(w, `{"error": {"message": "Client rate limit exceeded", "type": "rate_limit_error"}}`, http.StatusTooManyRequests)
-			return
-		}
+	modelName, _ := reqJSON["model"].(string)
+	if modelName == "" {
+		http.Error(w, `{"error": {"message": "Missing model parameter", "type": "invalid_request_error"}}`, http.StatusBadRequest)
+		return nil, nil, nil, startTime, false
+	}
 
-		// 3. Read request body within MaxBodySize limits
-		var bodyReader io.Reader = r.Body
-		if cfg.MaxBodySize > 0 {
-			bodyReader = io.LimitReader(r.Body, cfg.MaxBodySize+1)
-		}
+	hCtx := &handlerCtx{
+		clientKey:     clientKey,
+		matchedClient: matchedClient,
+		rawBody:       rawBody,
+		reqJSON:       reqJSON,
+		modelName:     modelName,
+	}
 
-		rawBody, err := io.ReadAll(bodyReader)
+	// 5-9. Select route, build request, execute with retry on 429/500/503
+	const maxRetries = 2
+	var route *SelectedRoute
+	var resp *http.Response
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// 5. Select Route (Model/Provider/AuthKey)
+		var err error
+		route, err = router.SelectRoute(modelName)
 		if err != nil {
-			http.Error(w, `{"error": {"message": "Failed to read request body"}}`, http.StatusInternalServerError)
-			return
+			fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
+			http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
+			return nil, nil, hCtx, startTime, false
 		}
 
-		if cfg.MaxBodySize > 0 && int64(len(rawBody)) > cfg.MaxBodySize {
-			http.Error(w, `{"error": {"message": "Request body too large", "type": "invalid_request_error"}}`, http.StatusRequestEntityTooLarge)
-			return
+		// 6. Modify request body
+		modifiedBody, err := bodyModifier(rawBody, route)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to modify request body: %s"}}`, err.Error()), http.StatusInternalServerError)
+			return nil, nil, hCtx, startTime, false
 		}
 
-		if debug {
-			fmt.Printf("[DEBUG] --- INCOMING REQUEST ---\n")
-			fmt.Printf("[DEBUG] URL: %s %s\n", r.Method, r.URL.String())
-			for k, vv := range r.Header {
-				for _, v := range vv {
-					fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
-				}
+		// 7. Build Upstream Request
+		targetURL := route.ModelProvider.Upstream
+		if route.ModelProvider.ApiType == "gemini" {
+			isImageGen := strings.Contains(r.URL.Path, "/images/")
+			u := targetURL
+			if !strings.HasSuffix(u, "/") {
+				u += "/"
 			}
-			bodyStr := string(rawBody)
-			if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-				bodyStr = FormatJSON(rawBody)
-			}
-			fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
-		}
-
-		// 4. Parse request JSON to get model
-		var reqJSON map[string]interface{}
-		if err := json.Unmarshal(rawBody, &reqJSON); err != nil {
-			http.Error(w, `{"error": {"message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
-			return
-		}
-
-		modelName, _ := reqJSON["model"].(string)
-		if modelName == "" {
-			http.Error(w, `{"error": {"message": "Missing model parameter", "type": "invalid_request_error"}}`, http.StatusBadRequest)
-			return
-		}
-
-		// 5-9. Select route, build request, execute with retry on 429/500/503
-		const maxRetries = 2
-		var route *SelectedRoute
-		var resp *http.Response
-
-		for attempt := 0; attempt <= maxRetries; attempt++ {
-			// 5. Select Route (Model/Provider/AuthKey)
-			var err error
-			route, err = router.SelectRoute(modelName)
-			if err != nil {
-				fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
-				http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
-				return
-			}
-
-			// 6. Modify request body
-			modifiedBody, err := ModifyRequestBody(rawBody, route)
-			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to modify request body: %s"}}`, err.Error()), http.StatusInternalServerError)
-				return
-			}
-
-			// 7. Build Upstream Request
-			targetURL := route.ModelProvider.Upstream
-			if route.ModelProvider.ApiType == "gemini" {
+			u += route.ModelProvider.Model
+			if isImageGen {
+				u += ":generateContent"
+			} else {
 				isStream, _ := reqJSON["stream"].(bool)
-				u := targetURL
-				if !strings.HasSuffix(u, "/") {
-					u += "/"
-				}
-				u += route.ModelProvider.Model
 				if isStream {
 					u += ":streamGenerateContent"
 					if !strings.Contains(u, "?") {
@@ -242,90 +269,100 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 				} else {
 					u += ":generateContent"
 				}
-				targetURL = u
 			}
+			targetURL = u
+		}
 
-			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(modifiedBody))
-			if err != nil {
-				http.Error(w, `{"error": {"message": "Failed to build upstream request"}}`, http.StatusInternalServerError)
-				return
-			}
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(modifiedBody))
+		if err != nil {
+			http.Error(w, `{"error": {"message": "Failed to build upstream request"}}`, http.StatusInternalServerError)
+			return nil, nil, hCtx, startTime, false
+		}
 
-			// Copy request headers
-			for k, vv := range r.Header {
-				// Do not copy host, content-length, or accept-encoding to prevent compression
-				if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" {
-					continue
-				}
-				for _, v := range vv {
-					upstreamReq.Header.Add(k, v)
-				}
-			}
-
-			// Swap Authorization with chosen upstream auth key
-			if route.ModelProvider.ApiType == "gemini" {
-				upstreamReq.Header.Set("x-goog-api-key", route.AuthKey)
-				upstreamReq.Header.Del("Authorization")
-			} else {
-				upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
-			}
-			upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
-
-			if debug {
-				fmt.Printf("[DEBUG] --- OUTGOING REQUEST (attempt %d/%d) ---\n", attempt+1, maxRetries+1)
-				fmt.Printf("[DEBUG] Target URL: %s\n", upstreamReq.URL.String())
-				for k, vv := range upstreamReq.Header {
-					for _, v := range vv {
-						fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
-					}
-				}
-				bodyStr := string(modifiedBody)
-				if strings.HasPrefix(upstreamReq.Header.Get("Content-Type"), "application/json") {
-					bodyStr = FormatJSON(modifiedBody)
-				}
-				fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
-			}
-
-			// 8. Execute Upstream Request
-			client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
-			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to configure proxy client: %s"}}`, err.Error()), http.StatusInternalServerError)
-				return
-			}
-
-			resp, err = client.Do(upstreamReq)
-			if err != nil {
-				elapsed := time.Since(startTime)
-				fmt.Printf("[ERROR] Model=%s Provider=%s Key[%d] 502 %s Error: %v\n",
-					modelName, route.ModelProvider.Name, route.KeyIndex, elapsed, err)
-				http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, err.Error()), http.StatusBadGateway)
-				return
-			}
-
-			// 9. Record state status
-			stateMgr.RecordUpstreamResult(route.AuthKey, resp.StatusCode)
-
-			// Check if retry is needed for retryable status codes
-			if (resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503) && attempt < maxRetries {
-				resp.Body.Close()
-				fmt.Printf("[WARN] Upstream (key[%d]) returned %d, retrying with next key (attempt %d/%d)\n",
-					route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
-				startTime = time.Now()
+		// Copy request headers
+		for k, vv := range r.Header {
+			if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" {
 				continue
 			}
-			break
+			for _, v := range vv {
+				upstreamReq.Header.Add(k, v)
+			}
 		}
-		defer resp.Body.Close()
+
+		// Swap Authorization with chosen upstream auth key
+		if route.ModelProvider.ApiType == "gemini" {
+			upstreamReq.Header.Set("x-goog-api-key", route.AuthKey)
+			upstreamReq.Header.Del("Authorization")
+		} else {
+			upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
+		}
+		upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
 
 		if debug {
-			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE ---\n")
-			fmt.Printf("[DEBUG] Status: %s\n", resp.Status)
-			for k, vv := range resp.Header {
+			fmt.Printf("[DEBUG] --- OUTGOING REQUEST (attempt %d/%d) ---\n", attempt+1, maxRetries+1)
+			fmt.Printf("[DEBUG] Target URL: %s\n", upstreamReq.URL.String())
+			for k, vv := range upstreamReq.Header {
 				for _, v := range vv {
 					fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
 				}
 			}
+			bodyStr := string(modifiedBody)
+			if strings.HasPrefix(upstreamReq.Header.Get("Content-Type"), "application/json") {
+				bodyStr = FormatJSON(modifiedBody)
+			}
+			fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
 		}
+
+		// 8. Execute Upstream Request
+		client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to configure proxy client: %s"}}`, err.Error()), http.StatusInternalServerError)
+			return nil, nil, hCtx, startTime, false
+		}
+
+		resp, err = client.Do(upstreamReq)
+		if err != nil {
+			elapsed := time.Since(startTime)
+			fmt.Printf("[ERROR] Model=%s Provider=%s Key[%d] 502 %s Error: %v\n",
+				modelName, route.ModelProvider.Name, route.KeyIndex, elapsed, err)
+			http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, err.Error()), http.StatusBadGateway)
+			return nil, nil, hCtx, startTime, false
+		}
+
+		// 9. Record state status
+		stateMgr.RecordUpstreamResult(route.AuthKey, resp.StatusCode)
+
+		// Check if retry is needed for retryable status codes
+		if (resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503) && attempt < maxRetries {
+			resp.Body.Close()
+			fmt.Printf("[WARN] Upstream (key[%d]) returned %d, retrying with next key (attempt %d/%d)\n",
+				route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
+			startTime = time.Now()
+			continue
+		}
+		break
+	}
+
+	if debug {
+		fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE ---\n")
+		fmt.Printf("[DEBUG] Status: %s\n", resp.Status)
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
+			}
+		}
+	}
+
+	return route, resp, hCtx, startTime, true
+}
+
+func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyRequestBody)
+		if !ok {
+			return
+		}
+		defer resp.Body.Close()
 
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
@@ -433,215 +470,17 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s\n",
-			time.Now().Format("2006-01-02 15:04:05.000"), modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
+			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 	}
 }
 
 func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		if r.Method != http.MethodPost {
-			http.Error(w, `{"error": {"message": "Method not allowed"}}`, http.StatusMethodNotAllowed)
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyImageRequestBody)
+		if !ok {
 			return
-		}
-
-		fmt.Printf("[INFO] [%s] /v1/images/generations request started ...\n", time.Now().Format("2006-01-02 15:04:05.000"))
-
-		// 1. Authenticate Client
-		authHeader := r.Header.Get("Authorization")
-		if len(authHeader) < 8 || authHeader[:7] != "Bearer " {
-			fmt.Printf("[WARN] Client authentication failed: Missing or invalid Authorization header\n")
-			http.Error(w, `{"error": {"message": "Missing or invalid Authorization header", "type": "invalid_request_error"}}`, http.StatusUnauthorized)
-			return
-		}
-		clientKey := authHeader[7:]
-
-		var matchedClient *ClientAuth
-		for i := range cfg.Clients.Auth {
-			if cfg.Clients.Auth[i].Key == clientKey {
-				matchedClient = &cfg.Clients.Auth[i]
-				break
-			}
-		}
-
-		if matchedClient == nil {
-			fmt.Printf("[WARN] Client authentication failed: Key not authorized\n")
-			http.Error(w, `{"error": {"message": "Invalid client auth key", "type": "invalid_request_error"}}`, http.StatusUnauthorized)
-			return
-		}
-
-		// 2. Client Rate Limiting
-		limit := cfg.Clients.RateLimit
-		if matchedClient.RateLimit > 0 {
-			limit = matchedClient.RateLimit
-		}
-
-		if !stateMgr.AllowClient(clientKey, limit) {
-			fmt.Printf("[WARN] Client %q rate limit exceeded\n", matchedClient.Name)
-			http.Error(w, `{"error": {"message": "Client rate limit exceeded", "type": "rate_limit_error"}}`, http.StatusTooManyRequests)
-			return
-		}
-
-		// 3. Read request body within MaxBodySize limits
-		var bodyReader io.Reader = r.Body
-		if cfg.MaxBodySize > 0 {
-			bodyReader = io.LimitReader(r.Body, cfg.MaxBodySize+1)
-		}
-
-		rawBody, err := io.ReadAll(bodyReader)
-		if err != nil {
-			http.Error(w, `{"error": {"message": "Failed to read request body"}}`, http.StatusInternalServerError)
-			return
-		}
-
-		if cfg.MaxBodySize > 0 && int64(len(rawBody)) > cfg.MaxBodySize {
-			http.Error(w, `{"error": {"message": "Request body too large", "type": "invalid_request_error"}}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		if debug {
-			fmt.Printf("[DEBUG] --- INCOMING REQUEST ---\n")
-			fmt.Printf("[DEBUG] URL: %s %s\n", r.Method, r.URL.String())
-			for k, vv := range r.Header {
-				for _, v := range vv {
-					fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
-				}
-			}
-			bodyStr := string(rawBody)
-			if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-				bodyStr = FormatJSON(rawBody)
-			}
-			fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
-		}
-
-		// 4. Parse request JSON to get model
-		var reqJSON map[string]interface{}
-		if err := json.Unmarshal(rawBody, &reqJSON); err != nil {
-			http.Error(w, `{"error": {"message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
-			return
-		}
-
-		modelName, _ := reqJSON["model"].(string)
-		if modelName == "" {
-			http.Error(w, `{"error": {"message": "Missing model parameter", "type": "invalid_request_error"}}`, http.StatusBadRequest)
-			return
-		}
-
-		// 5-9. Select route, build request, execute with retry on 429/500/503
-		const maxRetries = 2
-		var route *SelectedRoute
-		var resp *http.Response
-
-		for attempt := 0; attempt <= maxRetries; attempt++ {
-			// 5. Select Route (Model/Provider/AuthKey)
-			var err error
-			route, err = router.SelectRoute(modelName)
-			if err != nil {
-				fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
-				http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
-				return
-			}
-
-			// 6. Modify request body
-			modifiedBody, err := ModifyImageRequestBody(rawBody, route)
-			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to modify request body: %s"}}`, err.Error()), http.StatusInternalServerError)
-				return
-			}
-
-			// 7. Build Upstream Request
-			targetURL := route.ModelProvider.Upstream
-			if route.ModelProvider.ApiType == "gemini" {
-				u := targetURL
-				if !strings.HasSuffix(u, "/") {
-					u += "/"
-				}
-				u += route.ModelProvider.Model
-				u += ":generateContent"
-				targetURL = u
-			}
-
-			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(modifiedBody))
-			if err != nil {
-				http.Error(w, `{"error": {"message": "Failed to build upstream request"}}`, http.StatusInternalServerError)
-				return
-			}
-
-			// Copy request headers
-			for k, vv := range r.Header {
-				if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" {
-					continue
-				}
-				for _, v := range vv {
-					upstreamReq.Header.Add(k, v)
-				}
-			}
-
-			// Swap Authorization with chosen upstream auth key
-			if route.ModelProvider.ApiType == "gemini" {
-				upstreamReq.Header.Set("x-goog-api-key", route.AuthKey)
-				upstreamReq.Header.Del("Authorization")
-			} else {
-				upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
-			}
-			upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
-
-			if debug {
-				fmt.Printf("[DEBUG] --- OUTGOING REQUEST (attempt %d/%d) ---\n", attempt+1, maxRetries+1)
-				fmt.Printf("[DEBUG] Target URL: %s\n", upstreamReq.URL.String())
-				for k, vv := range upstreamReq.Header {
-					for _, v := range vv {
-						fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
-					}
-				}
-				bodyStr := string(modifiedBody)
-				if strings.HasPrefix(upstreamReq.Header.Get("Content-Type"), "application/json") {
-					bodyStr = FormatJSON(modifiedBody)
-				}
-				fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
-			}
-
-			// 8. Execute Upstream Request
-			client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
-			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to configure proxy client: %s"}}`, err.Error()), http.StatusInternalServerError)
-				return
-			}
-
-			resp, err = client.Do(upstreamReq)
-			if err != nil {
-				elapsed := time.Since(startTime)
-				fmt.Printf("[ERROR] Model=%s Provider=%s Key[%d] 502 %s Error: %v\n",
-					modelName, route.ModelProvider.Name, route.KeyIndex, elapsed, err)
-				http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, err.Error()), http.StatusBadGateway)
-				return
-			}
-
-			// 9. Record state status
-			stateMgr.RecordUpstreamResult(route.AuthKey, resp.StatusCode)
-
-			// Check if retry is needed for retryable status codes
-			if (resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503) && attempt < maxRetries {
-				resp.Body.Close()
-				fmt.Printf("[WARN] Upstream (key[%d]) returned %d, retrying with next key (attempt %d/%d)\n",
-					route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
-				startTime = time.Now()
-				continue
-			}
-			break
 		}
 		defer resp.Body.Close()
-
-		if debug {
-			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE ---\n")
-			fmt.Printf("[DEBUG] Status: %s\n", resp.Status)
-			for k, vv := range resp.Header {
-				for _, v := range vv {
-					fmt.Printf("[DEBUG] Header: %s: %s\n", k, v)
-				}
-			}
-		}
 
 		// 10. Copy headers back to client
 		for k, vv := range resp.Header {
@@ -679,7 +518,7 @@ func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router,
 
 		var modified []byte
 		if route.ModelProvider.ApiType == "gemini" {
-			modified, err = ProcessGeminiImageResponse(rawResp, rawBody)
+			modified, err = ProcessGeminiImageResponse(rawResp, hCtx.rawBody)
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				return
@@ -695,6 +534,6 @@ func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router,
 		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Image)\n",
-			time.Now().Format("2006-01-02 15:04:05.000"), modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
+			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 	}
 }
