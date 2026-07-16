@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -435,9 +436,10 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, err
 								"args": args,
 							},
 						}
-						if thoughtSig != "" {
-							part["thoughtSignature"] = thoughtSig
+						if thoughtSig == "" {
+							thoughtSig = "skip_thought_signature_validator"
 						}
+						part["thoughtSignature"] = thoughtSig
 						parts = append(parts, part)
 					}
 				}
@@ -1247,4 +1249,253 @@ func FormatJSON(data []byte) string {
 		return string(data)
 	}
 	return string(formatted)
+}
+
+func TransformImageRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+	var body map[string]interface{}
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
+	}
+
+	prompt, _ := body["prompt"].(string)
+	if prompt == "" {
+		return nil, errors.New("missing prompt parameter")
+	}
+
+	geminiReq := map[string]interface{}{
+		"contents": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"parts": []interface{}{
+					map[string]interface{}{
+						"text": prompt,
+					},
+				},
+			},
+		},
+	}
+
+	generationConfig := map[string]interface{}{
+		"responseModalities": []string{"IMAGE"},
+	}
+
+	if n, ok := body["n"].(float64); ok {
+		generationConfig["candidateCount"] = int(n)
+	} else if n, ok := body["n"].(int); ok {
+		generationConfig["candidateCount"] = n
+	}
+
+	size, _ := body["size"].(string)
+	aspectRatio := "1:1"
+	imageSize := "1K"
+	if size != "" {
+		parts := strings.Split(size, "x")
+		if len(parts) == 2 {
+			width, errW := strconv.Atoi(parts[0])
+			height, errH := strconv.Atoi(parts[1])
+			if errW == nil && errH == nil {
+				if width == height {
+					aspectRatio = "1:1"
+				} else if width > height {
+					if width == 1024 && height == 576 {
+						aspectRatio = "16:9"
+					} else if width == 1024 && height == 768 {
+						aspectRatio = "4:3"
+					} else if width == 1152 && height == 896 {
+						aspectRatio = "4:3"
+					} else if width == 1344 && height == 768 {
+						aspectRatio = "16:9"
+					} else {
+						aspectRatio = "16:9"
+					}
+				} else {
+					if width == 576 && height == 1024 {
+						aspectRatio = "9:16"
+					} else if width == 768 && height == 1024 {
+						aspectRatio = "3:4"
+					} else if width == 896 && height == 1152 {
+						aspectRatio = "3:4"
+					} else if width == 768 && height == 1344 {
+						aspectRatio = "9:16"
+					} else {
+						aspectRatio = "9:16"
+					}
+				}
+
+				maxDim := width
+				if height > width {
+					maxDim = height
+				}
+				if maxDim <= 1024 {
+					imageSize = "1K"
+				} else if maxDim <= 2048 {
+					imageSize = "2K"
+				} else {
+					imageSize = "4K"
+				}
+			}
+		}
+	}
+
+	generationConfig["imageConfig"] = map[string]interface{}{
+		"aspectRatio": aspectRatio,
+		"imageSize":   imageSize,
+	}
+
+	geminiReq["generationConfig"] = generationConfig
+
+	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
+	for _, configMap := range route.ModelProvider.RequestBody.Extra {
+		deepMerge(geminiReq, configMap)
+	}
+
+	return json.Marshal(geminiReq)
+}
+
+func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, error) {
+	var geminiResp map[string]interface{}
+	if err := json.Unmarshal(rawResp, &geminiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse Gemini response: %w", err)
+	}
+
+	var reqJSON map[string]interface{}
+	_ = json.Unmarshal(rawRequest, &reqJSON) // ignore error, might be empty
+
+	type OpenAIImageData struct {
+		B64JSON string `json:"b64_json"`
+	}
+
+	openAIResp := map[string]interface{}{
+		"created": time.Now().Unix(),
+		"data":    []OpenAIImageData{},
+	}
+
+	// Copy requested extra fields if present
+	if background, exists := reqJSON["background"]; exists {
+		openAIResp["background"] = background
+	}
+	if outputFormat, exists := reqJSON["output_format"]; exists {
+		openAIResp["output_format"] = outputFormat
+	}
+	if size, exists := reqJSON["size"]; exists {
+		openAIResp["size"] = size
+	}
+	if quality, exists := reqJSON["quality"]; exists {
+		openAIResp["quality"] = quality
+	}
+
+	// Include usage block
+	inputTokens := 0
+	outputTokens := 0
+	totalTokens := 0
+
+	if um, ok := geminiResp["usageMetadata"].(map[string]interface{}); ok {
+		if pt, ok := um["promptTokenCount"].(float64); ok {
+			inputTokens = int(pt)
+		} else if pt, ok := um["prompt_token_count"].(float64); ok {
+			inputTokens = int(pt)
+		}
+
+		if ct, ok := um["candidatesTokenCount"].(float64); ok {
+			outputTokens = int(ct)
+		} else if ct, ok := um["candidates_token_count"].(float64); ok {
+			outputTokens = int(ct)
+		}
+
+		if tt, ok := um["totalTokenCount"].(float64); ok {
+			totalTokens = int(tt)
+		} else if tt, ok := um["total_token_count"].(float64); ok {
+			totalTokens = int(tt)
+		}
+	}
+
+	openAIResp["usage"] = map[string]interface{}{
+		"input_tokens":  inputTokens,
+		"output_tokens": outputTokens,
+		"total_tokens":  totalTokens,
+	}
+
+	candidates, _ := geminiResp["candidates"].([]interface{})
+	var dataItems []OpenAIImageData
+
+	for _, cand := range candidates {
+		candMap, ok := cand.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		content, _ := candMap["content"].(map[string]interface{})
+		parts, _ := content["parts"].([]interface{})
+
+		for _, part := range parts {
+			partMap, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			var inlineData map[string]interface{}
+			if id, ok := partMap["inlineData"].(map[string]interface{}); ok {
+				inlineData = id
+			} else if id, ok := partMap["inline_data"].(map[string]interface{}); ok {
+				inlineData = id
+			}
+
+			if inlineData != nil {
+				base64Data, _ := inlineData["data"].(string)
+				if base64Data != "" {
+					item := OpenAIImageData{
+						B64JSON: base64Data,
+					}
+					dataItems = append(dataItems, item)
+				}
+			}
+		}
+	}
+
+	openAIResp["data"] = dataItems
+
+	return json.Marshal(openAIResp)
+}
+
+func ModifyImageRequestBody(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+	if route.ModelProvider.ApiType == "gemini" {
+		return TransformImageRequestToGemini(rawBody, route)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
+	}
+
+	// 1. Replace Model Name
+	body["model"] = route.ModelProvider.Model
+
+	// 2. Delete Configured Keys
+	for _, item := range route.ModelProvider.RequestBody.Delete {
+		if str, ok := item.(string); ok {
+			delete(body, str)
+		} else if m, ok := item.(map[string]interface{}); ok {
+			for k := range m {
+				delete(body, k)
+			}
+		} else if m, ok := item.(map[interface{}]interface{}); ok {
+			for k := range m {
+				if s, ok := k.(string); ok {
+					delete(body, s)
+				}
+			}
+		}
+	}
+
+	// 3. Add/Replace Extra Fields
+	for _, extraMap := range route.ModelProvider.RequestBody.Extra {
+		deepMerge(body, extraMap)
+	}
+
+	modified, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal modified JSON: %w", err)
+	}
+
+	return modified, nil
 }

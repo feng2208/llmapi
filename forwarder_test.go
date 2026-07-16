@@ -922,3 +922,279 @@ func TestDeepMergeSlices(t *testing.T) {
 		t.Errorf("Expected tool 2 to be google_search map, got %v", tool2)
 	}
 }
+
+func TestTransformImageRequestToGemini(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model: "gemini-3.1-flash-image",
+			RequestBody: RequestBodyConfig{
+				Extra: []map[string]interface{}{
+					{
+						"generationConfig": map[string]interface{}{
+							"thinkingConfig": map[string]interface{}{
+								"thinkingLevel": "HIGH",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	reqBody := []byte(`{
+		"prompt": "A cute orange cat",
+		"n": 2,
+		"size": "1024x768"
+	}`)
+
+	modified, err := TransformImageRequestToGemini(reqBody, route)
+	if err != nil {
+		t.Fatalf("Failed to transform: %v", err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(modified, &m); err != nil {
+		t.Fatalf("Modified is not valid JSON: %v", err)
+	}
+
+	// Verify prompt
+	contents := m["contents"].([]interface{})
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	if parts[0].(map[string]interface{})["text"] != "A cute orange cat" {
+		t.Errorf("Expected prompt 'A cute orange cat', got %v", parts[0])
+	}
+
+	// Verify generationConfig
+	genConfig := m["generationConfig"].(map[string]interface{})
+	if genConfig["candidateCount"].(float64) != 2 {
+		t.Errorf("Expected candidateCount 2, got %v", genConfig["candidateCount"])
+	}
+
+	// Verify imageConfig size parsing (1024x768 is 4:3 aspect ratio, 1024 max dim is 1K size)
+	imgConfig := genConfig["imageConfig"].(map[string]interface{})
+	if imgConfig["aspectRatio"] != "4:3" {
+		t.Errorf("Expected aspectRatio '4:3', got %q", imgConfig["aspectRatio"])
+	}
+	if imgConfig["imageSize"] != "1K" {
+		t.Errorf("Expected imageSize '1K', got %q", imgConfig["imageSize"])
+	}
+
+	// Verify merged extra
+	thinking := genConfig["thinkingConfig"].(map[string]interface{})
+	if thinking["thinkingLevel"] != "HIGH" {
+		t.Errorf("Expected merged thinkingLevel 'HIGH', got %q", thinking["thinkingLevel"])
+	}
+}
+
+func TestProcessGeminiImageResponse(t *testing.T) {
+	geminiResp := []byte(`{
+		"candidates": [
+			{
+				"content": {
+					"parts": [
+						{
+							"inlineData": {
+								"mimeType": "image/png",
+								"data": "iVBORw0KGgoAAAANSUhEUgAA"
+							}
+						}
+					]
+				}
+			}
+		],
+		"usageMetadata": {
+			"promptTokenCount": 3,
+			"candidatesTokenCount": 1120,
+			"totalTokenCount": 1123
+		}
+	}`)
+
+	clientReq := []byte(`{
+		"prompt": "A cute orange cat",
+		"size": "1024x1024",
+		"quality": "medium",
+		"output_format": "png",
+		"background": "opaque"
+	}`)
+
+	// 1. Test DEFAULT response format (omitted), which should return 'b64_json'
+	respDefault, err := ProcessGeminiImageResponse(geminiResp, clientReq)
+	if err != nil {
+		t.Fatalf("Failed to process default: %v", err)
+	}
+
+	var mDefault map[string]interface{}
+	if err := json.Unmarshal(respDefault, &mDefault); err != nil {
+		t.Fatalf("Processed default resp is not valid JSON: %v", err)
+	}
+
+	if mDefault["background"] != "opaque" {
+		t.Errorf("Expected background 'opaque', got %v", mDefault["background"])
+	}
+	if mDefault["output_format"] != "png" {
+		t.Errorf("Expected output_format 'png', got %v", mDefault["output_format"])
+	}
+	if mDefault["size"] != "1024x1024" {
+		t.Errorf("Expected size '1024x1024', got %v", mDefault["size"])
+	}
+	if mDefault["quality"] != "medium" {
+		t.Errorf("Expected quality 'medium', got %v", mDefault["quality"])
+	}
+
+	usage := mDefault["usage"].(map[string]interface{})
+	if usage["total_tokens"].(float64) != 1123 {
+		t.Errorf("Expected usage total_tokens 1123, got %v", usage["total_tokens"])
+	}
+	if usage["input_tokens"].(float64) != 3 {
+		t.Errorf("Expected usage input_tokens 3, got %v", usage["input_tokens"])
+	}
+	if usage["output_tokens"].(float64) != 1120 {
+		t.Errorf("Expected usage output_tokens 1120, got %v", usage["output_tokens"])
+	}
+
+	dataDefault := mDefault["data"].([]interface{})
+	if len(dataDefault) != 1 {
+		t.Fatalf("Expected 1 data item, got %d", len(dataDefault))
+	}
+
+	itemDefault := dataDefault[0].(map[string]interface{})
+	if itemDefault["b64_json"] != "iVBORw0KGgoAAAANSUhEUgAA" {
+		t.Errorf("Expected b64_json 'iVBORw0KGgoAAAANSUhEUgAA', got %q", itemDefault["b64_json"])
+	}
+
+	// 2. Test that explicit 'url' client format is IGNORED and returns 'b64_json' anyway
+	clientReqURL := []byte(`{
+		"response_format": "url"
+	}`)
+	respURL, err := ProcessGeminiImageResponse(geminiResp, clientReqURL)
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	var mURL map[string]interface{}
+	_ = json.Unmarshal(respURL, &mURL)
+	dataURL := mURL["data"].([]interface{})
+	itemURL := dataURL[0].(map[string]interface{})
+	if itemURL["b64_json"] != "iVBORw0KGgoAAAANSUhEUgAA" {
+		t.Errorf("Expected b64_json 'iVBORw0KGgoAAAANSUhEUgAA', got %q", itemURL["b64_json"])
+	}
+}
+
+func TestModifyImageRequestBody(t *testing.T) {
+	// 1. OpenAI-compatible route
+	routeOpenAI := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model: "dall-e-3",
+			RequestBody: RequestBodyConfig{
+				Delete: []interface{}{"moderation"},
+				Extra: []map[string]interface{}{
+					{"style": "vivid"},
+				},
+			},
+		},
+	}
+
+	clientReq := []byte(`{
+		"prompt": "A sunset",
+		"moderation": "auto",
+		"size": "512x512"
+	}`)
+
+	modOpenAI, err := ModifyImageRequestBody(clientReq, routeOpenAI)
+	if err != nil {
+		t.Fatalf("Failed: %v", err)
+	}
+
+	var mOpenAI map[string]interface{}
+	_ = json.Unmarshal(modOpenAI, &mOpenAI)
+
+	if mOpenAI["model"] != "dall-e-3" {
+		t.Errorf("Expected model 'dall-e-3', got %v", mOpenAI["model"])
+	}
+	if _, exists := mOpenAI["moderation"]; exists {
+		t.Error("Expected moderation to be deleted")
+	}
+	if mOpenAI["style"] != "vivid" {
+		t.Errorf("Expected style 'vivid', got %v", mOpenAI["style"])
+	}
+
+	// 2. Gemini route
+	routeGemini := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model:   "gemini-3.1-flash-image",
+			ApiType: "gemini",
+		},
+	}
+
+	modGemini, err := ModifyImageRequestBody(clientReq, routeGemini)
+	if err != nil {
+		t.Fatalf("Failed: %v", err)
+	}
+
+	var mGemini map[string]interface{}
+	_ = json.Unmarshal(modGemini, &mGemini)
+	if _, exists := mGemini["contents"]; !exists {
+		t.Error("Expected transformed Gemini request with 'contents' field")
+	}
+}
+
+func TestGeminiTranslationBypass(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+		},
+	}
+
+	openAIReq := map[string]interface{}{
+		"model": "gpt-4o",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "assistant",
+				"tool_calls": []interface{}{
+					map[string]interface{}{
+						"id":   "call_xyz123",
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      "get_current_temperature",
+							"arguments": `{"location":"London"}`,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	reqBytes, err := json.Marshal(openAIReq)
+	if err != nil {
+		t.Fatalf("Failed to marshal OpenAI request: %v", err)
+	}
+
+	translatedBytes, err := TransformRequestToGemini(reqBytes, route)
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(translatedBytes, &geminiReq); err != nil {
+		t.Fatalf("Failed to unmarshal translated Gemini request: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) != 1 {
+		t.Fatalf("Expected 1 item in contents, got %v", len(contents))
+	}
+
+	turn := contents[0].(map[string]interface{})
+	parts := turn["parts"].([]interface{})
+	if len(parts) != 1 {
+		t.Fatalf("Expected 1 part, got %d", len(parts))
+	}
+
+	fcPart := parts[0].(map[string]interface{})
+	if fcPart["thoughtSignature"] != "skip_thought_signature_validator" {
+		t.Errorf("Expected thoughtSignature 'skip_thought_signature_validator', got %v", fcPart["thoughtSignature"])
+	}
+}
+
