@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -230,7 +234,7 @@ func TestModifyRequestBody(t *testing.T) {
 	}
 
 	// 1. Test with Gemini provider (bypass should be injected)
-	modifiedGemini, err := ModifyRequestBody(rawJSON, routeGemini)
+	modifiedGemini, _, err := ModifyRequestBody(rawJSON, routeGemini, nil)
 	if err != nil {
 		t.Fatalf("Failed to modify body for gemini: %v", err)
 	}
@@ -314,7 +318,7 @@ func TestModifyRequestBody(t *testing.T) {
 		},
 	}
 
-	modifiedOther, err := ModifyRequestBody(rawJSON, routeOther)
+	modifiedOther, _, err := ModifyRequestBody(rawJSON, routeOther, nil)
 	if err != nil {
 		t.Fatalf("Failed to modify body for other: %v", err)
 	}
@@ -1100,7 +1104,7 @@ func TestModifyImageRequestBody(t *testing.T) {
 		"size": "512x512"
 	}`)
 
-	modOpenAI, err := ModifyImageRequestBody(clientReq, routeOpenAI)
+	modOpenAI, _, err := ModifyImageRequestBody(clientReq, routeOpenAI, nil)
 	if err != nil {
 		t.Fatalf("Failed: %v", err)
 	}
@@ -1126,7 +1130,7 @@ func TestModifyImageRequestBody(t *testing.T) {
 		},
 	}
 
-	modGemini, err := ModifyImageRequestBody(clientReq, routeGemini)
+	modGemini, _, err := ModifyImageRequestBody(clientReq, routeGemini, nil)
 	if err != nil {
 		t.Fatalf("Failed: %v", err)
 	}
@@ -1197,4 +1201,322 @@ func TestGeminiTranslationBypass(t *testing.T) {
 		t.Errorf("Expected thoughtSignature 'skip_thought_signature_validator', got %v", fcPart["thoughtSignature"])
 	}
 }
+
+func TestModifyImageEditRequestBody(t *testing.T) {
+	// Construct route for Gemini
+	routeGemini := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+			RequestBody: RequestBodyConfig{
+				Extra: []map[string]interface{}{
+					{"generationConfig": map[string]interface{}{"temperature": 0.5}},
+				},
+			},
+		},
+		AuthKey:  "test-api-key",
+		KeyIndex: 0,
+	}
+
+	// Construct route for OpenAI (non-gemini)
+	routeOpenAI := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "openai",
+			Model:   "dall-e-2",
+			ApiType: "openai",
+			RequestBody: RequestBodyConfig{
+				Delete: []interface{}{"n"},
+				Extra: []map[string]interface{}{
+					{"size": "512x512"},
+				},
+			},
+		},
+		AuthKey:  "test-api-key",
+		KeyIndex: 0,
+	}
+
+	// Create a multipart request body helper
+	createMultipartRequest := func(t *testing.T) (*http.Request, []byte) {
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
+
+		_ = writer.WriteField("model", "original-model")
+		_ = writer.WriteField("prompt", "a cute dog wearing a hat")
+		_ = writer.WriteField("n", "1")
+		_ = writer.WriteField("size", "1024x1024")
+
+		part, err := writer.CreateFormFile("image", "dog.png")
+		if err != nil {
+			t.Fatalf("failed to create image field: %v", err)
+		}
+		_, _ = part.Write([]byte("fake-png-data"))
+
+		_ = writer.Close()
+
+		req, err := http.NewRequest("POST", "/v1/images/edits", &buf)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+
+		return req, buf.Bytes()
+	}
+
+	// Test 1: Gemini Translation
+	reqGemini, rawBodyGemini := createMultipartRequest(t)
+	// We need to parse multipart form first as executeUpstreamRequest does
+	err := reqGemini.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("failed to parse form: %v", err)
+	}
+
+	modifiedGemini, contentTypeGemini, err := ModifyImageEditRequestBody(rawBodyGemini, routeGemini, reqGemini)
+	if err != nil {
+		t.Fatalf("Gemini ModifyImageEditRequestBody failed: %v", err)
+	}
+
+	if contentTypeGemini != "application/json; charset=utf-8" {
+		t.Errorf("Expected Content-Type 'application/json; charset=utf-8', got %q", contentTypeGemini)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(modifiedGemini, &geminiReq); err != nil {
+		t.Fatalf("Failed to parse gemini request JSON: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) == 0 {
+		t.Fatalf("Invalid contents in Gemini request: %v", geminiReq)
+	}
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("Expected 2 parts (prompt text and inline image), got %d", len(parts))
+	}
+	promptText := parts[0].(map[string]interface{})["text"].(string)
+	if promptText != "a cute dog wearing a hat" {
+		t.Errorf("Expected prompt text 'a cute dog wearing a hat', got %q", promptText)
+	}
+	inlineData := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	if inlineData["mime_type"] != "image/png" {
+		t.Errorf("Expected mime_type 'image/png', got %v", inlineData["mime_type"])
+	}
+
+	// Check generationConfig
+	genConfig := geminiReq["generationConfig"].(map[string]interface{})
+	if genConfig["candidateCount"].(float64) != 1 {
+		t.Errorf("Expected candidateCount 1, got %v", genConfig["candidateCount"])
+	}
+	if genConfig["temperature"].(float64) != 0.5 {
+		t.Errorf("Expected temperature 0.5, got %v", genConfig["temperature"])
+	}
+	imageConfig := genConfig["imageConfig"].(map[string]interface{})
+	if imageConfig["aspectRatio"] != "1:1" {
+		t.Errorf("Expected aspectRatio 1:1, got %v", imageConfig["aspectRatio"])
+	}
+
+	// Test 2: OpenAI (non-gemini) Modification
+	reqOpenAI, rawBodyOpenAI := createMultipartRequest(t)
+	err = reqOpenAI.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("failed to parse form: %v", err)
+	}
+
+	modifiedOpenAI, contentTypeOpenAI, err := ModifyImageEditRequestBody(rawBodyOpenAI, routeOpenAI, reqOpenAI)
+	if err != nil {
+		t.Fatalf("OpenAI ModifyImageEditRequestBody failed: %v", err)
+	}
+
+	if !strings.HasPrefix(contentTypeOpenAI, "multipart/form-data; boundary=") {
+		t.Errorf("Expected Content-Type starting with 'multipart/form-data; boundary=', got %q", contentTypeOpenAI)
+	}
+
+	// Parse modified body back as multipart request
+	parsedReq, err := http.NewRequest("POST", "/v1/images/edits", bytes.NewReader(modifiedOpenAI))
+	if err != nil {
+		t.Fatalf("failed to construct request from modified: %v", err)
+	}
+	parsedReq.Header.Set("Content-Type", contentTypeOpenAI)
+	err = parsedReq.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("failed to parse modified multipart form: %v", err)
+	}
+
+	if parsedReq.FormValue("model") != "dall-e-2" {
+		t.Errorf("Expected model replaced with 'dall-e-2', got %q", parsedReq.FormValue("model"))
+	}
+	if parsedReq.FormValue("size") != "512x512" {
+		t.Errorf("Expected size replaced with extra field '512x512', got %q", parsedReq.FormValue("size"))
+	}
+	if parsedReq.FormValue("n") != "" {
+		t.Errorf("Expected key 'n' deleted, but got %q", parsedReq.FormValue("n"))
+	}
+
+	// Verify image file is still present
+	imageHeaders := parsedReq.MultipartForm.File["image"]
+	if len(imageHeaders) == 0 {
+		t.Error("Expected image file header in modified body, got none")
+	} else {
+		fh := imageHeaders[0]
+		file, err := fh.Open()
+		if err != nil {
+			t.Fatalf("failed to open image: %v", err)
+		}
+		data, _ := io.ReadAll(file)
+		if string(data) != "fake-png-data" {
+			t.Errorf("Expected file content 'fake-png-data', got %q", string(data))
+		}
+	}
+}
+
+func TestModifyImageEditRequestBody_MultipleImages(t *testing.T) {
+	routeGemini := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model:   "gemini-1.5-pro",
+			ApiType: "gemini",
+			RequestBody: RequestBodyConfig{
+				Extra: []map[string]interface{}{
+					{"temperature": 0.5},
+				},
+			},
+		},
+	}
+
+	routeOpenAI := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model:   "dall-e-2",
+			ApiType: "openai",
+			RequestBody: RequestBodyConfig{
+				Delete: []interface{}{"n"},
+				Extra: []map[string]interface{}{
+					{"size": "512x512"},
+				},
+			},
+		},
+	}
+
+	createMultipartRequestMultiple := func(t *testing.T) (*http.Request, []byte) {
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
+
+		_ = writer.WriteField("model", "original-model")
+		_ = writer.WriteField("prompt", "compare these two images")
+		_ = writer.WriteField("n", "1")
+		_ = writer.WriteField("size", "1024x1024")
+
+		part1, err := writer.CreateFormFile("image[]", "img1.png")
+		if err != nil {
+			t.Fatalf("failed to create image[] part 1: %v", err)
+		}
+		_, _ = part1.Write([]byte("fake-png-data-1"))
+
+		part2, err := writer.CreateFormFile("image[]", "img2.png")
+		if err != nil {
+			t.Fatalf("failed to create image[] part 2: %v", err)
+		}
+		_, _ = part2.Write([]byte("fake-png-data-2"))
+
+		_ = writer.Close()
+
+		req, err := http.NewRequest("POST", "/v1/images/edits", &buf)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+
+		return req, buf.Bytes()
+	}
+
+	// Test 1: Gemini Translation with Multiple Images
+	reqGemini, rawBodyGemini := createMultipartRequestMultiple(t)
+	err := reqGemini.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("failed to parse form: %v", err)
+	}
+
+	modifiedGemini, contentTypeGemini, err := ModifyImageEditRequestBody(rawBodyGemini, routeGemini, reqGemini)
+	if err != nil {
+		t.Fatalf("Gemini ModifyImageEditRequestBody failed: %v", err)
+	}
+
+	if contentTypeGemini != "application/json; charset=utf-8" {
+		t.Errorf("Expected Content-Type 'application/json; charset=utf-8', got %q", contentTypeGemini)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(modifiedGemini, &geminiReq); err != nil {
+		t.Fatalf("Failed to parse gemini request JSON: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) == 0 {
+		t.Fatalf("Invalid contents in Gemini request: %v", geminiReq)
+	}
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	// Expected: 1 text part (prompt) + 2 image parts
+	if len(parts) != 3 {
+		t.Fatalf("Expected 3 parts (prompt text and 2 inline images), got %d", len(parts))
+	}
+	promptText := parts[0].(map[string]interface{})["text"].(string)
+	if promptText != "compare these two images" {
+		t.Errorf("Expected prompt text 'compare these two images', got %q", promptText)
+	}
+
+	// Verify image 1
+	img1Data := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	if img1Data["mime_type"] != "image/png" {
+		t.Errorf("Expected img1 mime_type 'image/png', got %v", img1Data["mime_type"])
+	}
+	// Verify image 2
+	img2Data := parts[2].(map[string]interface{})["inline_data"].(map[string]interface{})
+	if img2Data["mime_type"] != "image/png" {
+		t.Errorf("Expected img2 mime_type 'image/png', got %v", img2Data["mime_type"])
+	}
+
+	// Test 2: OpenAI Modification with Multiple Images
+	reqOpenAI, rawBodyOpenAI := createMultipartRequestMultiple(t)
+	err = reqOpenAI.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("failed to parse form: %v", err)
+	}
+
+	modifiedOpenAI, contentTypeOpenAI, err := ModifyImageEditRequestBody(rawBodyOpenAI, routeOpenAI, reqOpenAI)
+	if err != nil {
+		t.Fatalf("OpenAI ModifyImageEditRequestBody failed: %v", err)
+	}
+
+	// Parse modified body back as multipart request
+	parsedReq, err := http.NewRequest("POST", "/v1/images/edits", bytes.NewReader(modifiedOpenAI))
+	if err != nil {
+		t.Fatalf("failed to construct request from modified: %v", err)
+	}
+	parsedReq.Header.Set("Content-Type", contentTypeOpenAI)
+	err = parsedReq.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("failed to parse modified multipart form: %v", err)
+	}
+
+	// Verify image[] files are still present and both of them exist
+	imageHeaders := parsedReq.MultipartForm.File["image[]"]
+	if len(imageHeaders) != 2 {
+		t.Errorf("Expected 2 image[] file headers in modified body, got %d", len(imageHeaders))
+	} else {
+		fh1 := imageHeaders[0]
+		file1, _ := fh1.Open()
+		data1, _ := io.ReadAll(file1)
+		file1.Close()
+		if string(data1) != "fake-png-data-1" {
+			t.Errorf("Expected file 1 content 'fake-png-data-1', got %q", string(data1))
+		}
+
+		fh2 := imageHeaders[1]
+		file2, _ := fh2.Open()
+		data2, _ := io.ReadAll(file2)
+		file2.Close()
+		if string(data2) != "fake-png-data-2" {
+			t.Errorf("Expected file 2 content 'fake-png-data-2', got %q", string(data2))
+		}
+	}
+}
+
 

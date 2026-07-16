@@ -930,3 +930,180 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 
 	return json.Marshal(openAIResp)
 }
+
+func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([]byte, error) {
+	if r.MultipartForm == nil {
+		return nil, errors.New("multipart form not parsed")
+	}
+
+	prompt := r.FormValue("prompt")
+	if prompt == "" {
+		return nil, errors.New("missing prompt parameter")
+	}
+
+	var parts []interface{}
+	parts = append(parts, map[string]interface{}{
+		"text": prompt,
+	})
+
+	// Get image
+	imageKeys := []string{"image", "image[]"}
+	for _, key := range imageKeys {
+		for _, fh := range r.MultipartForm.File[key] {
+			file, err := fh.Open()
+			if err != nil {
+				return nil, fmt.Errorf("failed to open image: %w", err)
+			}
+
+			data, err := io.ReadAll(file)
+			file.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read image: %w", err)
+			}
+
+			mimeType := fh.Header.Get("Content-Type")
+			if mimeType == "" || mimeType == "application/octet-stream" {
+				fnLower := strings.ToLower(fh.Filename)
+				if strings.HasSuffix(fnLower, ".png") {
+					mimeType = "image/png"
+				} else if strings.HasSuffix(fnLower, ".jpg") || strings.HasSuffix(fnLower, ".jpeg") {
+					mimeType = "image/jpeg"
+				} else if strings.HasSuffix(fnLower, ".webp") {
+					mimeType = "image/webp"
+				} else {
+					mimeType = "image/png"
+				}
+			}
+
+			parts = append(parts, map[string]interface{}{
+				"inline_data": map[string]interface{}{
+					"mime_type": mimeType,
+					"data":      base64.StdEncoding.EncodeToString(data),
+				},
+			})
+		}
+	}
+
+	// Optionally get mask
+	maskHeaders := r.MultipartForm.File["mask"]
+	if len(maskHeaders) > 0 {
+		fh := maskHeaders[0]
+		file, err := fh.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open mask: %w", err)
+		}
+		defer file.Close()
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read mask: %w", err)
+		}
+
+		mimeType := fh.Header.Get("Content-Type")
+		if mimeType == "" || mimeType == "application/octet-stream" {
+			fnLower := strings.ToLower(fh.Filename)
+			if strings.HasSuffix(fnLower, ".png") {
+				mimeType = "image/png"
+			} else if strings.HasSuffix(fnLower, ".jpg") || strings.HasSuffix(fnLower, ".jpeg") {
+				mimeType = "image/jpeg"
+			} else if strings.HasSuffix(fnLower, ".webp") {
+				mimeType = "image/webp"
+			} else {
+				mimeType = "image/png"
+			}
+		}
+
+		parts = append(parts, map[string]interface{}{
+			"inline_data": map[string]interface{}{
+				"mime_type": mimeType,
+				"data":      base64.StdEncoding.EncodeToString(data),
+			},
+		})
+	}
+
+	geminiReq := map[string]interface{}{
+		"contents": []interface{}{
+			map[string]interface{}{
+				"role":  "user",
+				"parts": parts,
+			},
+		},
+	}
+
+	generationConfig := map[string]interface{}{
+		"responseModalities": []string{"IMAGE"},
+	}
+
+	nStr := r.FormValue("n")
+	if nStr != "" {
+		if n, err := strconv.Atoi(nStr); err == nil {
+			generationConfig["candidateCount"] = n
+		}
+	}
+
+	size := r.FormValue("size")
+	aspectRatio := "1:1"
+	imageSize := "1K"
+	if size != "" {
+		parts := strings.Split(size, "x")
+		if len(parts) == 2 {
+			width, errW := strconv.Atoi(parts[0])
+			height, errH := strconv.Atoi(parts[1])
+			if errW == nil && errH == nil {
+				if width == height {
+					aspectRatio = "1:1"
+				} else if width > height {
+					if width == 1024 && height == 576 {
+						aspectRatio = "16:9"
+					} else if width == 1024 && height == 768 {
+						aspectRatio = "4:3"
+					} else if width == 1152 && height == 896 {
+						aspectRatio = "4:3"
+					} else if width == 1344 && height == 768 {
+						aspectRatio = "16:9"
+					} else {
+						aspectRatio = "16:9"
+					}
+				} else {
+					if width == 576 && height == 1024 {
+						aspectRatio = "9:16"
+					} else if width == 768 && height == 1024 {
+						aspectRatio = "3:4"
+					} else if width == 896 && height == 1152 {
+						aspectRatio = "3:4"
+					} else if width == 768 && height == 1344 {
+						aspectRatio = "9:16"
+					} else {
+						aspectRatio = "9:16"
+					}
+				}
+
+				maxDim := width
+				if height > width {
+					maxDim = height
+				}
+				if maxDim <= 1024 {
+					imageSize = "1K"
+				} else if maxDim <= 2048 {
+					imageSize = "2K"
+				} else {
+					imageSize = "4K"
+				}
+			}
+		}
+	}
+
+	generationConfig["imageConfig"] = map[string]interface{}{
+		"aspectRatio": aspectRatio,
+		"imageSize":   imageSize,
+	}
+
+	geminiReq["generationConfig"] = generationConfig
+
+	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
+	for _, configMap := range route.ModelProvider.RequestBody.Extra {
+		deepMerge(geminiReq, configMap)
+	}
+
+	return json.Marshal(geminiReq)
+}

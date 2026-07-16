@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"strings"
 )
 
@@ -33,14 +37,18 @@ func applyDeleteAndExtra(body map[string]interface{}, route *SelectedRoute) {
 }
 
 // ModifyRequestBody applies the delete, extra, and model replacement rules.
-func ModifyRequestBody(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+func ModifyRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
 	if route.ModelProvider.ApiType == "gemini" {
-		return TransformRequestToGemini(rawBody, route)
+		modified, err := TransformRequestToGemini(rawBody, route)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
 	}
 
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
+		return nil, "", fmt.Errorf("failed to parse JSON request body: %w", err)
 	}
 
 	// 1. Replace Model Name
@@ -96,20 +104,24 @@ func ModifyRequestBody(rawBody []byte, route *SelectedRoute) ([]byte, error) {
 
 	modified, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal modified JSON: %w", err)
+		return nil, "", fmt.Errorf("failed to marshal modified JSON: %w", err)
 	}
 
-	return modified, nil
+	return modified, "application/json; charset=utf-8", nil
 }
 
-func ModifyImageRequestBody(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+func ModifyImageRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
 	if route.ModelProvider.ApiType == "gemini" {
-		return TransformImageRequestToGemini(rawBody, route)
+		modified, err := TransformImageRequestToGemini(rawBody, route)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
 	}
 
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
+		return nil, "", fmt.Errorf("failed to parse JSON request body: %w", err)
 	}
 
 	// 1. Replace Model Name
@@ -120,10 +132,10 @@ func ModifyImageRequestBody(rawBody []byte, route *SelectedRoute) ([]byte, error
 
 	modified, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal modified JSON: %w", err)
+		return nil, "", fmt.Errorf("failed to marshal modified JSON: %w", err)
 	}
 
-	return modified, nil
+	return modified, "application/json; charset=utf-8", nil
 }
 
 type StreamExtractor struct {
@@ -283,4 +295,99 @@ func ProcessJSONResponse(respBody []byte, startTag, endTag string) []byte {
 		return respBody
 	}
 	return modified
+}
+
+func ModifyImageEditMultipartBody(r *http.Request, route *SelectedRoute) ([]byte, string, error) {
+	if r.MultipartForm == nil {
+		return nil, "", errors.New("multipart form not parsed")
+	}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// Collect text fields
+	fields := make(map[string]string)
+	for k, values := range r.MultipartForm.Value {
+		if len(values) > 0 {
+			fields[k] = values[0]
+		}
+	}
+
+	// 1. Replace Model Name
+	fields["model"] = route.ModelProvider.Model
+
+	// 2. Apply delete & extra config
+	for _, item := range route.ModelProvider.RequestBody.Delete {
+		if str, ok := item.(string); ok {
+			delete(fields, str)
+		} else if m, ok := item.(map[string]interface{}); ok {
+			for k := range m {
+				delete(fields, k)
+			}
+		} else if m, ok := item.(map[interface{}]interface{}); ok {
+			for k := range m {
+				if s, ok := k.(string); ok {
+					delete(fields, s)
+				}
+			}
+		}
+	}
+	for _, extraMap := range route.ModelProvider.RequestBody.Extra {
+		for k, v := range extraMap {
+			fields[k] = fmt.Sprintf("%v", v)
+		}
+	}
+
+	// Write text fields
+	for k, v := range fields {
+		err := writer.WriteField(k, v)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+
+	// Write files
+	for fieldName, fileHeaders := range r.MultipartForm.File {
+		for _, fh := range fileHeaders {
+			file, err := fh.Open()
+			if err != nil {
+				return nil, "", err
+			}
+
+			part, err := writer.CreateFormFile(fieldName, fh.Filename)
+			if err != nil {
+				file.Close()
+				return nil, "", err
+			}
+			_, err = io.Copy(part, file)
+			file.Close()
+			if err != nil {
+				return nil, "", err
+			}
+		}
+	}
+
+	err := writer.Close()
+	if err != nil {
+		return nil, "", err
+	}
+
+	return buf.Bytes(), writer.FormDataContentType(), nil
+}
+
+func ModifyImageEditRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
+	if route.ModelProvider.ApiType == "gemini" {
+		modified, err := TransformImageEditRequestToGemini(r, route)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+	}
+
+	// For standard API providers, rebuild the multipart form with modified fields
+	modifiedBody, contentType, err := ModifyImageEditMultipartBody(r, route)
+	if err != nil {
+		return nil, "", err
+	}
+	return modifiedBody, contentType, nil
 }

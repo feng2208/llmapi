@@ -61,6 +61,7 @@ func main() {
 	http.HandleFunc("/v1/models", handleModels(cfg))
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions(cfg, stateMgr, router, proxyMgr))
 	http.HandleFunc("/v1/images/generations", handleImageGenerations(cfg, stateMgr, router, proxyMgr))
+	http.HandleFunc("/v1/images/edits", handleImageEdits(cfg, stateMgr, router, proxyMgr))
 
 	fmt.Printf("[INFO] [%s] Server starting, listening on %s\n", time.Now().Format("2006-01-02 15:04:05.000"), cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, nil); err != nil {
@@ -125,7 +126,7 @@ func executeUpstreamRequest(
 	stateMgr *StateManager,
 	router *Router,
 	proxyMgr *ProxyManager,
-	bodyModifier func(rawBody []byte, route *SelectedRoute) ([]byte, error),
+	bodyModifier func(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error),
 ) (*SelectedRoute, *http.Response, *handlerCtx, time.Time, bool) {
 	startTime := time.Now()
 
@@ -188,6 +189,9 @@ func executeUpstreamRequest(
 		return nil, nil, nil, startTime, false
 	}
 
+	// Restore r.Body so that subsequent parses (like ParseMultipartForm) can run if needed.
+	r.Body = io.NopCloser(bytes.NewReader(rawBody))
+
 	if debug {
 		fmt.Printf("[DEBUG] --- INCOMING REQUEST ---\n")
 		fmt.Printf("[DEBUG] URL: %s %s\n", r.Method, r.URL.String())
@@ -203,14 +207,33 @@ func executeUpstreamRequest(
 		fmt.Printf("[DEBUG] Body:\n%s\n", bodyStr)
 	}
 
-	// 4. Parse request JSON to get model
+	// 4. Parse request JSON to get model (or multipart form)
 	var reqJSON map[string]interface{}
-	if err := json.Unmarshal(rawBody, &reqJSON); err != nil {
-		http.Error(w, `{"error": {"message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
-		return nil, nil, nil, startTime, false
+	var modelName string
+
+	isMultipart := strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data")
+	if isMultipart {
+		err := r.ParseMultipartForm(32 << 20) // 32MB
+		if err != nil {
+			http.Error(w, `{"error": {"message": "Failed to parse multipart form"}}`, http.StatusBadRequest)
+			return nil, nil, nil, startTime, false
+		}
+		modelName = r.FormValue("model")
+		// Synthesize a reqJSON for backward compatibility / debug logs
+		reqJSON = make(map[string]interface{})
+		reqJSON["model"] = modelName
+		reqJSON["prompt"] = r.FormValue("prompt")
+		reqJSON["n"] = r.FormValue("n")
+		reqJSON["size"] = r.FormValue("size")
+		reqJSON["response_format"] = r.FormValue("response_format")
+	} else {
+		if err := json.Unmarshal(rawBody, &reqJSON); err != nil {
+			http.Error(w, `{"error": {"message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
+			return nil, nil, nil, startTime, false
+		}
+		modelName, _ = reqJSON["model"].(string)
 	}
 
-	modelName, _ := reqJSON["model"].(string)
 	if modelName == "" {
 		http.Error(w, `{"error": {"message": "Missing model parameter", "type": "invalid_request_error"}}`, http.StatusBadRequest)
 		return nil, nil, nil, startTime, false
@@ -240,7 +263,7 @@ func executeUpstreamRequest(
 		}
 
 		// 6. Modify request body
-		modifiedBody, err := bodyModifier(rawBody, route)
+		modifiedBody, contentTypeOut, err := bodyModifier(rawBody, route, r)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error": {"message": "Failed to modify request body: %s"}}`, err.Error()), http.StatusInternalServerError)
 			return nil, nil, hCtx, startTime, false
@@ -281,13 +304,14 @@ func executeUpstreamRequest(
 
 		// Copy request headers
 		for k, vv := range r.Header {
-			if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" {
+			if k == "Host" || k == "Content-Length" || k == "Accept-Encoding" || k == "Content-Type" {
 				continue
 			}
 			for _, v := range vv {
 				upstreamReq.Header.Add(k, v)
 			}
 		}
+		upstreamReq.Header.Set("Content-Type", contentTypeOut)
 
 		// Swap Authorization with chosen upstream auth key
 		if route.ModelProvider.ApiType == "gemini" {
@@ -534,6 +558,70 @@ func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router,
 		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Image)\n",
+			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
+	}
+}
+
+func handleImageEdits(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyImageEditRequestBody)
+		if !ok {
+			return
+		}
+		defer resp.Body.Close()
+
+		// 10. Copy headers back to client
+		for k, vv := range resp.Header {
+			if k == "Content-Length" {
+				continue
+			}
+			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
+				continue
+			}
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+		// 11. Process and write response body
+		rawResp, err := io.ReadAll(resp.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+
+		if resp.StatusCode == 400 {
+			fmt.Printf("[WARN] Upstream returned HTTP 400. Response body:\n%s\n", string(rawResp))
+		}
+
+		if debug {
+			bodyStr := string(rawResp)
+			if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+				bodyStr = FormatJSON(rawResp)
+			}
+			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
+		}
+
+		var modified []byte
+		if route.ModelProvider.ApiType == "gemini" {
+			modified, err = ProcessGeminiImageResponse(rawResp, hCtx.rawBody)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+		} else {
+			modified = rawResp
+		}
+
+		w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(modified)
+
+		// Access logging
+		elapsed := time.Since(startTime)
+		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Image Edit)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 	}
 }
