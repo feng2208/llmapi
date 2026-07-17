@@ -52,6 +52,14 @@ models:
                   includeThoughts: true
                   thinkingLevel: HIGH
 
+  - name: gemini-2.5-flash-preview-tts
+    providers:
+      - name: gemini
+        upstream: https://generativelanguage.googleapis.com/v1beta/models/
+        model: gemini-2.5-flash-preview-tts
+        rate_limit: 10
+        api_type: gemini
+
 
 providers:
   - name: gemini

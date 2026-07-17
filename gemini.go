@@ -1107,3 +1107,196 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 
 	return json.Marshal(geminiReq)
 }
+
+func CreateWavHeader(dataLen int) []byte {
+	header := make([]byte, 44)
+	// RIFF header
+	copy(header[0:4], "RIFF")
+	// File size - 8
+	fileSize := uint32(dataLen + 36)
+	header[4] = byte(fileSize)
+	header[5] = byte(fileSize >> 8)
+	header[6] = byte(fileSize >> 16)
+	header[7] = byte(fileSize >> 24)
+	// WAVE
+	copy(header[8:12], "WAVE")
+	// fmt chunk
+	copy(header[12:16], "fmt ")
+	// Chunk size (16 for PCM)
+	header[16] = 16
+	header[17] = 0
+	header[18] = 0
+	header[19] = 0
+	// Audio format (1 for PCM)
+	header[20] = 1
+	header[21] = 0
+	// Number of channels (1)
+	header[22] = 1
+	header[23] = 0
+	// Sample rate (24000)
+	sampleRate := uint32(24000)
+	header[24] = byte(sampleRate)
+	header[25] = byte(sampleRate >> 8)
+	header[26] = byte(sampleRate >> 16)
+	header[27] = byte(sampleRate >> 24)
+	// Byte rate (sampleRate * numChannels * bitsPerSample/8) = 24000 * 1 * 2 = 48000
+	byteRate := uint32(48000)
+	header[28] = byte(byteRate)
+	header[29] = byte(byteRate >> 8)
+	header[30] = byte(byteRate >> 16)
+	header[31] = byte(byteRate >> 24)
+	// Block align (numChannels * bitsPerSample/8) = 2
+	header[32] = 2
+	header[33] = 0
+	// Bits per sample (16)
+	header[34] = 16
+	header[35] = 0
+	// data chunk
+	copy(header[36:40], "data")
+	// Chunk size
+	subchunk2Size := uint32(dataLen)
+	header[40] = byte(subchunk2Size)
+	header[41] = byte(subchunk2Size >> 8)
+	header[42] = byte(subchunk2Size >> 16)
+	header[43] = byte(subchunk2Size >> 24)
+	return header
+}
+
+func TransformAudioSpeechRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+	var body map[string]interface{}
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
+	}
+
+	inputText, _ := body["input"].(string)
+	if inputText == "" {
+		return nil, errors.New("missing input parameter")
+	}
+
+	voiceName, _ := body["voice"].(string)
+	if voiceName == "" {
+		voiceName = "Kore" // Default
+	}
+
+	// Map OpenAI voice names to Gemini prebuilt voice names
+	voiceMapping := map[string]string{
+		"alloy":   "Puck",
+		"echo":    "Charon",
+		"fable":   "Kore",
+		"nova":    "Kore",
+		"onyx":    "Puck",
+		"shimmer": "Puck",
+	}
+
+	mappedVoice := voiceName
+	if val, ok := voiceMapping[strings.ToLower(voiceName)]; ok {
+		mappedVoice = val
+	}
+
+	geminiReq := map[string]interface{}{
+		"contents": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"parts": []interface{}{
+					map[string]interface{}{
+						"text": inputText,
+					},
+				},
+			},
+		},
+	}
+
+	generationConfig := map[string]interface{}{
+		"responseModalities": []string{"AUDIO"},
+		"speechConfig": map[string]interface{}{
+			"voiceConfig": map[string]interface{}{
+				"prebuiltVoiceConfig": map[string]interface{}{
+					"voiceName": mappedVoice,
+				},
+			},
+		},
+	}
+
+	if speedVal, ok := body["speed"].(float64); ok && speedVal != 1.0 {
+		if speedVal < 0.6 {
+			inputText = "[very slow] " + inputText
+		} else if speedVal < 0.85 {
+			inputText = "[slow] " + inputText
+		} else if speedVal > 1.8 {
+			inputText = "[very fast] " + inputText
+		} else if speedVal > 1.15 {
+			inputText = "[fast] " + inputText
+		}
+		geminiReq["contents"].([]interface{})[0].(map[string]interface{})["parts"].([]interface{})[0].(map[string]interface{})["text"] = inputText
+	}
+
+	geminiReq["generationConfig"] = generationConfig
+
+	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
+	for _, configMap := range route.ModelProvider.RequestBody.Extra {
+		deepMerge(geminiReq, configMap)
+	}
+
+	return json.Marshal(geminiReq)
+}
+
+func ProcessGeminiAudioResponse(rawResp []byte, rawRequest []byte) ([]byte, error) {
+	var geminiResp map[string]interface{}
+	if err := json.Unmarshal(rawResp, &geminiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse Gemini response: %w", err)
+	}
+
+	candidates, _ := geminiResp["candidates"].([]interface{})
+	if len(candidates) == 0 {
+		return nil, errors.New("no candidates in Gemini response")
+	}
+
+	candMap, ok := candidates[0].(map[string]interface{})
+	if !ok {
+		return nil, errors.New("invalid candidate format")
+	}
+
+	content, _ := candMap["content"].(map[string]interface{})
+	parts, _ := content["parts"].([]interface{})
+	if len(parts) == 0 {
+		return nil, errors.New("no parts in Gemini response content")
+	}
+
+	partMap, ok := parts[0].(map[string]interface{})
+	if !ok {
+		return nil, errors.New("invalid part format")
+	}
+
+	var inlineData map[string]interface{}
+	if id, ok := partMap["inlineData"].(map[string]interface{}); ok {
+		inlineData = id
+	} else if id, ok := partMap["inline_data"].(map[string]interface{}); ok {
+		inlineData = id
+	}
+
+	if inlineData == nil {
+		return nil, errors.New("missing inlineData in Gemini response")
+	}
+
+	base64Data, _ := inlineData["data"].(string)
+	if base64Data == "" {
+		return nil, errors.New("missing audio data in Gemini response")
+	}
+
+	pcmData, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 audio data: %w", err)
+	}
+
+	var reqJSON map[string]interface{}
+	_ = json.Unmarshal(rawRequest, &reqJSON)
+	responseFormat, _ := reqJSON["response_format"].(string)
+
+	if strings.ToLower(responseFormat) == "pcm" {
+		return pcmData, nil
+	}
+
+	// Wrap PCM in a WAV header
+	wavHeader := CreateWavHeader(len(pcmData))
+	return append(wavHeader, pcmData...), nil
+}

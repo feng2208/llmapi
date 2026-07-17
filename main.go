@@ -62,6 +62,7 @@ func main() {
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions(cfg, stateMgr, router, proxyMgr))
 	http.HandleFunc("/v1/images/generations", handleImageGenerations(cfg, stateMgr, router, proxyMgr))
 	http.HandleFunc("/v1/images/edits", handleImageEdits(cfg, stateMgr, router, proxyMgr))
+	http.HandleFunc("/v1/audio/speech", handleAudioSpeech(cfg, stateMgr, router, proxyMgr))
 
 	fmt.Printf("[INFO] [%s] Server starting, listening on %s\n", time.Now().Format("2006-01-02 15:04:05.000"), cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, nil); err != nil {
@@ -273,12 +274,13 @@ func executeUpstreamRequest(
 		targetURL := route.ModelProvider.Upstream
 		if route.ModelProvider.ApiType == "gemini" {
 			isImageGen := strings.Contains(r.URL.Path, "/images/")
+			isAudioSpeech := strings.Contains(r.URL.Path, "/audio/")
 			u := targetURL
 			if !strings.HasSuffix(u, "/") {
 				u += "/"
 			}
 			u += route.ModelProvider.Model
-			if isImageGen {
+			if isImageGen || isAudioSpeech {
 				u += ":generateContent"
 			} else {
 				isStream, _ := reqJSON["stream"].(bool)
@@ -622,6 +624,91 @@ func handleImageEdits(cfg *Config, stateMgr *StateManager, router *Router, proxy
 		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Image Edit)\n",
+			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
+	}
+}
+
+func handleAudioSpeech(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyAudioSpeechRequestBody)
+		if !ok {
+			return
+		}
+		defer resp.Body.Close()
+
+		// 10. Copy headers back to client
+		for k, vv := range resp.Header {
+			if k == "Content-Length" {
+				continue
+			}
+			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
+				continue
+			}
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+
+		// Set content type for client
+		if route.ModelProvider.ApiType == "gemini" {
+			var reqJSON map[string]interface{}
+			_ = json.Unmarshal(hCtx.rawBody, &reqJSON)
+			responseFormat, _ := reqJSON["response_format"].(string)
+			switch strings.ToLower(responseFormat) {
+			case "pcm":
+				w.Header().Set("Content-Type", "audio/pcm")
+			case "wav":
+				w.Header().Set("Content-Type", "audio/wav")
+			default:
+				w.Header().Set("Content-Type", "audio/wav") // Default returned format is WAV for client
+			}
+		}
+
+		// 11. Process and write response body
+		rawResp, err := io.ReadAll(resp.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+
+		if resp.StatusCode == 400 {
+			fmt.Printf("[WARN] Upstream returned HTTP 400. Response body:\n%s\n", string(rawResp))
+		}
+
+		if debug {
+			bodyStr := string(rawResp)
+			if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+				bodyStr = FormatJSON(rawResp)
+			} else {
+				bodyStr = fmt.Sprintf("[Binary audio data, size: %d bytes]", len(rawResp))
+			}
+			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
+		}
+
+		var modified []byte
+		if route.ModelProvider.ApiType == "gemini" {
+			modified, err = ProcessGeminiAudioResponse(rawResp, hCtx.rawBody)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				if json.Valid(rawResp) {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.Header().Set("Content-Length", strconv.Itoa(len(rawResp)))
+					w.WriteHeader(resp.StatusCode)
+					_, _ = w.Write(rawResp)
+				}
+				return
+			}
+		} else {
+			modified = rawResp
+		}
+
+		w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(modified)
+
+		// Access logging
+		elapsed := time.Since(startTime)
+		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Speech)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 	}
 }

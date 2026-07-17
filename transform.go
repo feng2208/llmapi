@@ -391,3 +391,31 @@ func ModifyImageEditRequestBody(rawBody []byte, route *SelectedRoute, r *http.Re
 	}
 	return modifiedBody, contentType, nil
 }
+
+func ModifyAudioSpeechRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
+	if route.ModelProvider.ApiType == "gemini" {
+		modified, err := TransformAudioSpeechRequestToGemini(rawBody, route)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil, "", fmt.Errorf("failed to parse JSON request body: %w", err)
+	}
+
+	// 1. Replace Model Name
+	body["model"] = route.ModelProvider.Model
+
+	// 2. Apply delete & extra config
+	applyDeleteAndExtra(body, route)
+
+	modified, err := json.Marshal(body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to marshal modified JSON: %w", err)
+	}
+
+	return modified, "application/json; charset=utf-8", nil
+}

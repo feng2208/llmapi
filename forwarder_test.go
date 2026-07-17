@@ -1519,4 +1519,103 @@ func TestModifyImageEditRequestBody_MultipleImages(t *testing.T) {
 	}
 }
 
+func TestAudioSpeechTranslation(t *testing.T) {
+	// Test request translation from OpenAI to Gemini
+	openAIReq := []byte(`{
+		"model": "tts-1",
+		"input": "Hello world from the speech generator!",
+		"voice": "alloy",
+		"speed": 1.5,
+		"response_format": "mp3"
+	}`)
+
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-3.1-flash-tts-preview",
+			ApiType: "gemini",
+		},
+	}
+
+	translated, err := TransformAudioSpeechRequestToGemini(openAIReq, route)
+	if err != nil {
+		t.Fatalf("TransformAudioSpeechRequestToGemini failed: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(translated, &parsed); err != nil {
+		t.Fatalf("Failed to parse translated request JSON: %v", err)
+	}
+
+	// Verify input text and speed tag prefix
+	contents := parsed["contents"].([]interface{})
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	text := parts[0].(map[string]interface{})["text"].(string)
+	if !strings.Contains(text, "[fast]") || !strings.Contains(text, "Hello world") {
+		t.Errorf("Expected [fast] prefix, got %q", text)
+	}
+
+	// Verify voice config mapping (alloy -> Puck)
+	genConfig := parsed["generationConfig"].(map[string]interface{})
+	modalities := genConfig["responseModalities"].([]interface{})
+	if modalities[0].(string) != "AUDIO" {
+		t.Errorf("Expected responseModalities [\"AUDIO\"], got %v", modalities)
+	}
+	speechConfig := genConfig["speechConfig"].(map[string]interface{})
+	voiceName := speechConfig["voiceConfig"].(map[string]interface{})["prebuiltVoiceConfig"].(map[string]interface{})["voiceName"].(string)
+	if voiceName != "Puck" {
+		t.Errorf("Expected mapped voice name 'Puck', got %q", voiceName)
+	}
+
+	// Test response translation
+	geminiResp := []byte(`{
+		"candidates": [
+			{
+				"content": {
+					"parts": [
+						{
+							"inlineData": {
+								"mimeType": "audio/pcm",
+								"data": "SGVsbG8="
+							}
+						}
+					]
+				}
+			}
+		]
+	}`)
+
+	// SGVsbG8= is base64 for "Hello"
+	outWav, err := ProcessGeminiAudioResponse(geminiResp, openAIReq)
+	if err != nil {
+		t.Fatalf("ProcessGeminiAudioResponse failed: %v", err)
+	}
+
+	// It should have WAV header by default since response_format is "mp3"
+	if len(outWav) <= 44 {
+		t.Errorf("Expected WAV output to be longer than 44 bytes, got %d", len(outWav))
+	}
+	if string(outWav[0:4]) != "RIFF" {
+		t.Errorf("Expected RIFF prefix, got %q", string(outWav[0:4]))
+	}
+	if string(outWav[44:]) != "Hello" {
+		t.Errorf("Expected decrypted content 'Hello', got %q", string(outWav[44:]))
+	}
+
+	// If response_format is "pcm", it should return raw PCM data
+	pcmReq := []byte(`{
+		"model": "tts-1",
+		"input": "Hello world",
+		"voice": "alloy",
+		"response_format": "pcm"
+	}`)
+	outPCM, err := ProcessGeminiAudioResponse(geminiResp, pcmReq)
+	if err != nil {
+		t.Fatalf("ProcessGeminiAudioResponse failed with pcm format: %v", err)
+	}
+	if string(outPCM) != "Hello" {
+		t.Errorf("Expected raw PCM data 'Hello', got %q", string(outPCM))
+	}
+}
+
 
