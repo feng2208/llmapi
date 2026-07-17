@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -1615,6 +1617,347 @@ func TestAudioSpeechTranslation(t *testing.T) {
 	}
 	if string(outPCM) != "Hello" {
 		t.Errorf("Expected raw PCM data 'Hello', got %q", string(outPCM))
+	}
+}
+
+func createTestMultipartRequest(t *testing.T, fields map[string]string, fileFieldName, fileName, fileContent string) *http.Request {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+
+	for k, v := range fields {
+		err := w.WriteField(k, v)
+		if err != nil {
+			t.Fatalf("Failed to write field %s: %v", k, err)
+		}
+	}
+
+	if fileFieldName != "" {
+		part, err := w.CreateFormFile(fileFieldName, fileName)
+		if err != nil {
+			t.Fatalf("Failed to create form file %s: %v", fileFieldName, err)
+		}
+		_, err = part.Write([]byte(fileContent))
+		if err != nil {
+			t.Fatalf("Failed to write file content: %v", err)
+		}
+	}
+
+	err := w.Close()
+	if err != nil {
+		t.Fatalf("Failed to close writer: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", "/v1/audio/transcriptions", &b)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	return req
+}
+
+func TestModifyAudioTranscriptionMultipartBody(t *testing.T) {
+	fields := map[string]string{
+		"model":           "whisper-1",
+		"response_format": "json",
+	}
+	req := createTestMultipartRequest(t, fields, "file", "test.mp3", "audiobytes")
+
+	err := req.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("ParseMultipartForm failed: %v", err)
+	}
+
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model: "upstream-whisper",
+			RequestBody: RequestBodyConfig{
+				Delete: []interface{}{"response_format"},
+				Extra: []map[string]interface{}{
+					{"temperature": 0.5},
+				},
+			},
+		},
+	}
+
+	body, contentType, err := ModifyAudioTranscriptionMultipartBody(req, route)
+	if err != nil {
+		t.Fatalf("ModifyAudioTranscriptionMultipartBody failed: %v", err)
+	}
+
+	if !strings.Contains(contentType, "multipart/form-data") {
+		t.Errorf("Expected multipart content type, got %s", contentType)
+	}
+
+	// Build a new request to parse and verify the modified fields
+	parsedReq, err := http.NewRequest("POST", "/v1/audio/transcriptions", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("Failed to create parsing request: %v", err)
+	}
+	parsedReq.Header.Set("Content-Type", contentType)
+
+	err = parsedReq.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("ParseMultipartForm on modified body failed: %v", err)
+	}
+
+	if parsedReq.FormValue("model") != "upstream-whisper" {
+		t.Errorf("Expected model to be replaced with 'upstream-whisper', got %q", parsedReq.FormValue("model"))
+	}
+
+	if parsedReq.FormValue("response_format") != "" {
+		t.Errorf("Expected response_format to be deleted, but got %q", parsedReq.FormValue("response_format"))
+	}
+
+	if parsedReq.FormValue("temperature") != "0.5" {
+		t.Errorf("Expected temperature to be extra injected with value '0.5', got %q", parsedReq.FormValue("temperature"))
+	}
+}
+
+func TestTransformAudioTranscriptionRequestToGeminiInline(t *testing.T) {
+	fields := map[string]string{
+		"model":           "whisper-1",
+		"response_format": "verbose_json",
+		"prompt":          "transcribe this clearly",
+		"language":        "en",
+	}
+	// Content-Type of file will be auto-detected or default to audio/mp3 based on filename
+	req := createTestMultipartRequest(t, fields, "file", "audio.mp3", "dummy-mp3-bytes")
+
+	err := req.ParseMultipartForm(32 << 20)
+	if err != nil {
+		t.Fatalf("ParseMultipartForm failed: %v", err)
+	}
+
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Model: "gemini-flash-1.5-transcribe",
+		},
+		AuthKey: "api-key",
+	}
+
+	cfg := &Config{
+		Proxy: "http://localhost:8080",
+	}
+	proxyMgr := NewProxyManager()
+
+	modified, err := TransformAudioTranscriptionRequestToGemini(req, route, cfg, proxyMgr)
+	if err != nil {
+		t.Fatalf("TransformAudioTranscriptionRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(modified, &geminiReq); err != nil {
+		t.Fatalf("Transformed body is not valid JSON: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) == 0 {
+		t.Fatal("Missing or invalid contents in Gemini request")
+	}
+
+	parts, ok := contents[0].(map[string]interface{})["parts"].([]interface{})
+	if !ok || len(parts) != 2 {
+		t.Fatalf("Expected 2 parts (instruction text + audio part), got %d parts", len(parts))
+	}
+
+	instruction, ok := parts[0].(map[string]interface{})["text"].(string)
+	if !ok || !strings.Contains(instruction, "Transcribe") {
+		t.Errorf("Expected transcription instructions, got %v", parts[0])
+	}
+	if !strings.Contains(instruction, "transcribe this clearly") {
+		t.Errorf("Expected user style prompt in instructions, got %q", instruction)
+	}
+	if !strings.Contains(instruction, "language is en") {
+		t.Errorf("Expected language instruction, got %q", instruction)
+	}
+
+	audioPart := parts[1].(map[string]interface{})
+	inlineData, ok := audioPart["inline_data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected inline_data part, got %v", audioPart)
+	}
+
+	if inlineData["mime_type"] != "audio/mp3" {
+		t.Errorf("Expected audio/mp3 mime_type, got %v", inlineData["mime_type"])
+	}
+
+	expectedBase64 := base64.StdEncoding.EncodeToString([]byte("dummy-mp3-bytes"))
+	if inlineData["data"] != expectedBase64 {
+		t.Errorf("Expected base64 audio data %q, got %q", expectedBase64, inlineData["data"])
+	}
+
+	genConfig, ok := geminiReq["generationConfig"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Missing generationConfig")
+	}
+
+	if genConfig["responseMimeType"] != "application/json" {
+		t.Errorf("Expected responseMimeType application/json, got %v", genConfig["responseMimeType"])
+	}
+
+	responseSchema, ok := genConfig["responseSchema"].(map[string]interface{})
+	if !ok || responseSchema["type"] != "OBJECT" {
+		t.Errorf("Expected Object responseSchema, got %v", responseSchema)
+	}
+}
+
+func TestProcessGeminiTranscriptionResponse_Simple(t *testing.T) {
+	geminiResp := []byte(`{
+		"candidates": [
+			{
+				"content": {
+					"parts": [
+						{
+							"text": "This is a simple transcription."
+						}
+					]
+				}
+			}
+		]
+	}`)
+
+	// Test mapping to JSON
+	outJSON, err := ProcessGeminiTranscriptionResponse(geminiResp, false, "", "json")
+	if err != nil {
+		t.Fatalf("ProcessGeminiTranscriptionResponse failed: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(outJSON, &parsed); err != nil {
+		t.Fatalf("Output is not valid JSON: %v", err)
+	}
+
+	if parsed["text"] != "This is a simple transcription." {
+		t.Errorf("Expected text 'This is a simple transcription.', got %q", parsed["text"])
+	}
+
+	// Test mapping to raw text
+	outText, err := ProcessGeminiTranscriptionResponse(geminiResp, false, "", "text")
+	if err != nil {
+		t.Fatalf("ProcessGeminiTranscriptionResponse failed: %v", err)
+	}
+
+	if string(outText) != "This is a simple transcription." {
+		t.Errorf("Expected raw text 'This is a simple transcription.', got %q", string(outText))
+	}
+}
+
+func TestProcessGeminiTranscriptionResponse_VerboseTimestamps(t *testing.T) {
+	geminiStructuredJSON := `{
+		"text": "Hello world. Testing SRT conversion.",
+		"segments": [
+			{"start": 0.0, "end": 1.5, "text": "Hello world."},
+			{"start": 1.5, "end": 4.25, "text": "Testing SRT conversion."}
+		]
+	}`
+
+	geminiResp := []byte(fmt.Sprintf(`{
+		"candidates": [
+			{
+				"content": {
+					"parts": [
+						{
+							"text": %q
+						}
+					]
+				}
+			}
+		]
+	}`, geminiStructuredJSON))
+
+	// 1. Test mapping to verbose_json
+	outVerbose, err := ProcessGeminiTranscriptionResponse(geminiResp, true, "french", "verbose_json")
+	if err != nil {
+		t.Fatalf("ProcessGeminiTranscriptionResponse verbose_json failed: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(outVerbose, &parsed); err != nil {
+		t.Fatalf("Output verbose_json is not valid JSON: %v", err)
+	}
+
+	if parsed["text"] != "Hello world. Testing SRT conversion." {
+		t.Errorf("Expected text 'Hello world. Testing SRT conversion.', got %q", parsed["text"])
+	}
+
+	if parsed["language"] != "french" {
+		t.Errorf("Expected language 'french', got %q", parsed["language"])
+	}
+
+	if parsed["duration"].(float64) != 4.25 {
+		t.Errorf("Expected duration 4.25, got %v", parsed["duration"])
+	}
+
+	segments, ok := parsed["segments"].([]interface{})
+	if !ok || len(segments) != 2 {
+		t.Fatalf("Expected 2 segments, got %v", parsed["segments"])
+	}
+
+	seg1 := segments[0].(map[string]interface{})
+	if seg1["id"].(float64) != 0 || seg1["start"].(float64) != 0.0 || seg1["end"].(float64) != 1.5 || seg1["text"] != "Hello world." {
+		t.Errorf("Segment 1 mismatch: %v", seg1)
+	}
+
+	seg2 := segments[1].(map[string]interface{})
+	if seg2["id"].(float64) != 1 || seg2["start"].(float64) != 1.5 || seg2["end"].(float64) != 4.25 || seg2["text"] != "Testing SRT conversion." {
+		t.Errorf("Segment 2 mismatch: %v", seg2)
+	}
+
+	// 2. Test mapping to srt format
+	outSRT, err := ProcessGeminiTranscriptionResponse(geminiResp, true, "", "srt")
+	if err != nil {
+		t.Fatalf("ProcessGeminiTranscriptionResponse srt failed: %v", err)
+	}
+
+	expectedSRT := "1\n00:00:00,000 --> 00:00:01,500\nHello world.\n\n2\n00:00:01,500 --> 00:00:04,250\nTesting SRT conversion.\n\n"
+	// Replace CRLF if any for OS independence
+	normalizedSRT := strings.ReplaceAll(string(outSRT), "\r\n", "\n")
+	if normalizedSRT != expectedSRT {
+		t.Errorf("SRT content mismatch.\nExpected:\n%q\nGot:\n%q", expectedSRT, normalizedSRT)
+	}
+
+	// 3. Test mapping to vtt format
+	outVTT, err := ProcessGeminiTranscriptionResponse(geminiResp, true, "", "vtt")
+	if err != nil {
+		t.Fatalf("ProcessGeminiTranscriptionResponse vtt failed: %v", err)
+	}
+
+	expectedVTT := "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.500\nHello world.\n\n2\n00:00:01.500 --> 00:00:04.250\nTesting SRT conversion.\n\n"
+	normalizedVTT := strings.ReplaceAll(string(outVTT), "\r\n", "\n")
+	if normalizedVTT != expectedVTT {
+		t.Errorf("VTT content mismatch.\nExpected:\n%q\nGot:\n%q", expectedVTT, normalizedVTT)
+	}
+}
+
+func TestProcessGeminiSTTStreamLine(t *testing.T) {
+	line := []byte(`data: {"candidates":[{"content":{"parts":[{"text":"Skies of blue"}]}}], "usageMetadata": {"promptTokenCount": 140, "candidatesTokenCount": 10, "totalTokenCount": 150, "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 100}, {"modality": "TEXT", "tokenCount": 40}]}}`)
+	delta, usage, err := ProcessGeminiSTTStreamLine(line)
+	if err != nil {
+		t.Fatalf("ProcessGeminiSTTStreamLine failed: %v", err)
+	}
+
+	if delta != "Skies of blue" {
+		t.Errorf("Expected delta 'Skies of blue', got %q", delta)
+	}
+
+	if usage == nil {
+		t.Fatal("Expected parsed usageMetadata, got nil")
+	}
+
+	if usage.PromptTokens != 140 || usage.CandidatesTokens != 10 || usage.TotalTokens != 150 {
+		t.Errorf("Usage mismatch: %+v", usage)
+	}
+
+	if usage.AudioTokens != 100 || usage.TextTokens != 40 {
+		t.Errorf("Usage promptTokensDetails mismatch: %+v", usage)
+	}
+
+	// Test EOF line
+	doneLine := []byte(`data: [DONE]`)
+	_, _, err = ProcessGeminiSTTStreamLine(doneLine)
+	if err != io.EOF {
+		t.Errorf("Expected io.EOF on [DONE], got %v", err)
 	}
 }
 

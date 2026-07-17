@@ -419,3 +419,97 @@ func ModifyAudioSpeechRequestBody(rawBody []byte, route *SelectedRoute, r *http.
 
 	return modified, "application/json; charset=utf-8", nil
 }
+
+func ModifyAudioTranscriptionMultipartBody(r *http.Request, route *SelectedRoute) ([]byte, string, error) {
+	if r.MultipartForm == nil {
+		return nil, "", errors.New("multipart form not parsed")
+	}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// Collect text fields
+	fields := make(map[string][]string)
+	for k, values := range r.MultipartForm.Value {
+		fields[k] = values
+	}
+
+	// 1. Replace Model Name
+	fields["model"] = []string{route.ModelProvider.Model}
+
+	// 2. Apply delete & extra config
+	for _, item := range route.ModelProvider.RequestBody.Delete {
+		if str, ok := item.(string); ok {
+			delete(fields, str)
+		} else if m, ok := item.(map[string]interface{}); ok {
+			for k := range m {
+				delete(fields, k)
+			}
+		} else if m, ok := item.(map[interface{}]interface{}); ok {
+			for k := range m {
+				if s, ok := k.(string); ok {
+					delete(fields, s)
+				}
+			}
+		}
+	}
+	for _, extraMap := range route.ModelProvider.RequestBody.Extra {
+		for k, v := range extraMap {
+			fields[k] = []string{fmt.Sprintf("%v", v)}
+		}
+	}
+
+	// Write text fields
+	for k, vv := range fields {
+		for _, v := range vv {
+			err := writer.WriteField(k, v)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+	}
+
+	// Write files
+	for fieldName, fileHeaders := range r.MultipartForm.File {
+		for _, fh := range fileHeaders {
+			file, err := fh.Open()
+			if err != nil {
+				return nil, "", err
+			}
+
+			part, err := writer.CreateFormFile(fieldName, fh.Filename)
+			if err != nil {
+				file.Close()
+				return nil, "", err
+			}
+			_, err = io.Copy(part, file)
+			file.Close()
+			if err != nil {
+				return nil, "", err
+			}
+		}
+	}
+
+	err := writer.Close()
+	if err != nil {
+		return nil, "", err
+	}
+
+	return buf.Bytes(), writer.FormDataContentType(), nil
+}
+
+func ModifyAudioTranscriptionRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request, cfg *Config, proxyMgr *ProxyManager) ([]byte, string, error) {
+	if route.ModelProvider.ApiType == "gemini" {
+		modified, err := TransformAudioTranscriptionRequestToGemini(r, route, cfg, proxyMgr)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+	}
+
+	modifiedBody, contentType, err := ModifyAudioTranscriptionMultipartBody(r, route)
+	if err != nil {
+		return nil, "", err
+	}
+	return modifiedBody, contentType, nil
+}

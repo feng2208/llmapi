@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1299,4 +1300,571 @@ func ProcessGeminiAudioResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 	// Wrap PCM in a WAV header
 	wavHeader := CreateWavHeader(len(pcmData))
 	return append(wavHeader, pcmData...), nil
+}
+
+func uploadFileToGemini(ctx context.Context, apiKey string, filename string, fileReader io.Reader, fileSize int64, mimeType string, route *SelectedRoute, cfg *Config, proxyMgr *ProxyManager) (string, string, error) {
+	client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get proxy client: %w", err)
+	}
+
+	// 1. Initial Metadata Request
+	initURL := fmt.Sprintf("https://generativelanguage.googleapis.com/upload/v1beta/files?key=%s", apiKey)
+
+	initBodyObj := map[string]interface{}{
+		"file": map[string]interface{}{
+			"display_name": filename,
+		},
+	}
+	initBodyBytes, err := json.Marshal(initBodyObj)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal init request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", initURL, bytes.NewReader(initBodyBytes))
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create init request: %w", err)
+	}
+
+	req.Header.Set("X-Goog-Upload-Protocol", "resumable")
+	req.Header.Set("X-Goog-Upload-Command", "start")
+	req.Header.Set("X-Goog-Upload-Header-Content-Length", fmt.Sprintf("%d", fileSize))
+	req.Header.Set("X-Goog-Upload-Header-Content-Type", mimeType)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("initiate upload failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBytes, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("initiate upload failed with status %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	uploadURL := resp.Header.Get("X-Goog-Upload-URL")
+	if uploadURL == "" {
+		return "", "", fmt.Errorf("missing X-Goog-Upload-URL header in initiate response")
+	}
+
+	// 2. Upload the Actual Bytes
+	uploadReq, err := http.NewRequestWithContext(ctx, "POST", uploadURL, fileReader)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create upload request: %w", err)
+	}
+
+	uploadReq.Header.Set("Content-Length", fmt.Sprintf("%d", fileSize))
+	uploadReq.Header.Set("X-Goog-Upload-Offset", "0")
+	uploadReq.Header.Set("X-Goog-Upload-Command", "upload, finalize")
+
+	uploadResp, err := client.Do(uploadReq)
+	if err != nil {
+		return "", "", fmt.Errorf("upload bytes failed: %w", err)
+	}
+	defer uploadResp.Body.Close()
+
+	if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
+		respBytes, _ := io.ReadAll(uploadResp.Body)
+		return "", "", fmt.Errorf("upload bytes failed with status %d: %s", uploadResp.StatusCode, string(respBytes))
+	}
+
+	var uploadResult struct {
+		File struct {
+			Name  string `json:"name"`
+			State string `json:"state"`
+			URI   string `json:"uri"`
+		} `json:"file"`
+	}
+
+	if err := json.NewDecoder(uploadResp.Body).Decode(&uploadResult); err != nil {
+		return "", "", fmt.Errorf("failed to decode upload response: %w", err)
+	}
+
+	fileName := uploadResult.File.Name
+	fileURI := uploadResult.File.URI
+	state := uploadResult.File.State
+
+	// 3. Poll for state if it is PROCESSING
+	if state == "PROCESSING" {
+		pollURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s?key=%s", fileName, apiKey)
+		for {
+			select {
+			case <-ctx.Done():
+				return "", "", ctx.Err()
+			default:
+			}
+
+			time.Sleep(1 * time.Second)
+
+			pollReq, err := http.NewRequestWithContext(ctx, "GET", pollURL, nil)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to create poll request: %w", err)
+			}
+
+			pollResp, err := client.Do(pollReq)
+			if err != nil {
+				return "", "", fmt.Errorf("polling failed: %w", err)
+			}
+
+			var pollResult struct {
+				State string `json:"state"`
+			}
+			err = json.NewDecoder(pollResp.Body).Decode(&pollResult)
+			pollResp.Body.Close()
+			if err != nil {
+				return "", "", fmt.Errorf("failed to decode poll response: %w", err)
+			}
+
+			if pollResult.State == "ACTIVE" {
+				break
+			}
+			if pollResult.State == "FAILED" {
+				return "", "", fmt.Errorf("file processing failed on Gemini side")
+			}
+		}
+	}
+
+	return fileName, fileURI, nil
+}
+
+func deleteFileFromGemini(ctx context.Context, apiKey string, fileName string, route *SelectedRoute, cfg *Config, proxyMgr *ProxyManager) {
+	client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
+	if err != nil {
+		fmt.Printf("[ERROR] failed to get client for deletion: %v\n", err)
+		return
+	}
+
+	deleteURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s?key=%s", fileName, apiKey)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", deleteURL, nil)
+	if err != nil {
+		fmt.Printf("[ERROR] failed to create delete request: %v\n", err)
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("[ERROR] delete file %s failed: %v\n", fileName, err)
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("[WARN] delete file %s returned status %d\n", fileName, resp.StatusCode)
+	} else {
+		fmt.Printf("[INFO] Successfully deleted Gemini file: %s\n", fileName)
+	}
+}
+
+func TransformAudioTranscriptionRequestToGemini(r *http.Request, route *SelectedRoute, cfg *Config, proxyMgr *ProxyManager) ([]byte, error) {
+	if r.MultipartForm == nil {
+		return nil, errors.New("multipart form not parsed")
+	}
+
+	fileHeaders := r.MultipartForm.File["file"]
+	if len(fileHeaders) == 0 {
+		return nil, errors.New("missing file in multipart request")
+	}
+	fh := fileHeaders[0]
+
+	file, err := fh.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	fileSize := fh.Size
+	mimeType := fh.Header.Get("Content-Type")
+	if mimeType == "" || mimeType == "application/octet-stream" {
+		fnLower := strings.ToLower(fh.Filename)
+		if strings.HasSuffix(fnLower, ".mp3") {
+			mimeType = "audio/mp3"
+		} else if strings.HasSuffix(fnLower, ".wav") {
+			mimeType = "audio/wav"
+		} else if strings.HasSuffix(fnLower, ".m4a") {
+			mimeType = "audio/m4a"
+		} else if strings.HasSuffix(fnLower, ".aac") {
+			mimeType = "audio/aac"
+		} else if strings.HasSuffix(fnLower, ".ogg") {
+			mimeType = "audio/ogg"
+		} else if strings.HasSuffix(fnLower, ".flac") {
+			mimeType = "audio/flac"
+		} else {
+			mimeType = "audio/mp3"
+		}
+	}
+
+	var audioPart map[string]interface{}
+	if fileSize <= 20*1024*1024 {
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %w", err)
+		}
+		audioPart = map[string]interface{}{
+			"inline_data": map[string]interface{}{
+				"mime_type": mimeType,
+				"data":      base64.StdEncoding.EncodeToString(data),
+			},
+		}
+	} else {
+		// Use Files API!
+		_, fileURI, err := uploadFileToGemini(r.Context(), route.AuthKey, fh.Filename, file, fileSize, mimeType, route, cfg, proxyMgr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload large file to Gemini Files API: %w", err)
+		}
+		audioPart = map[string]interface{}{
+			"file_data": map[string]interface{}{
+				"mime_type": mimeType,
+				"file_uri":  fileURI,
+			},
+		}
+	}
+
+	responseFormat := r.FormValue("response_format")
+	var hasTimestamps bool
+	if strings.ToLower(responseFormat) == "verbose_json" || strings.ToLower(responseFormat) == "srt" || strings.ToLower(responseFormat) == "vtt" {
+		hasTimestamps = true
+	}
+	for _, val := range r.MultipartForm.Value["timestamp_granularities[]"] {
+		if val == "segment" {
+			hasTimestamps = true
+		}
+	}
+	for _, val := range r.MultipartForm.Value["timestamp_granularities"] {
+		if val == "segment" {
+			hasTimestamps = true
+		}
+	}
+
+	userPrompt := r.FormValue("prompt")
+	language := r.FormValue("language")
+
+	var instruction string
+	if hasTimestamps {
+		instruction = "You are a professional audio transcriber. Transcribe the audio precisely. You must provide segment-level timestamps in seconds."
+		if language != "" {
+			instruction += fmt.Sprintf(" The audio language is %s.", language)
+		}
+		if userPrompt != "" {
+			instruction += fmt.Sprintf(" Style prompt from user: %s", userPrompt)
+		}
+	} else {
+		instruction = "You are a professional audio transcriber. Transcribe the audio precisely. Output ONLY the transcribed text. Do not add any introductory text, explanation, warnings, or markdown formatting (like ```)."
+		if language != "" {
+			instruction += fmt.Sprintf(" The audio language is %s.", language)
+		}
+		if userPrompt != "" {
+			instruction += fmt.Sprintf(" Style prompt from user: %s", userPrompt)
+		}
+	}
+
+	parts := []interface{}{
+		map[string]interface{}{
+			"text": instruction,
+		},
+		audioPart,
+	}
+
+	geminiReq := map[string]interface{}{
+		"contents": []interface{}{
+			map[string]interface{}{
+				"role":  "user",
+				"parts": parts,
+			},
+		},
+	}
+
+	generationConfig := map[string]interface{}{}
+	if hasTimestamps {
+		generationConfig["responseMimeType"] = "application/json"
+		generationConfig["responseSchema"] = map[string]interface{}{
+			"type": "OBJECT",
+			"properties": map[string]interface{}{
+				"text": map[string]interface{}{
+					"type":        "STRING",
+					"description": "The complete transcription of the audio.",
+				},
+				"segments": map[string]interface{}{
+					"type": "ARRAY",
+					"items": map[string]interface{}{
+						"type": "OBJECT",
+						"properties": map[string]interface{}{
+							"start": map[string]interface{}{
+								"type":        "NUMBER",
+								"description": "Start time of the segment in seconds.",
+							},
+							"end": map[string]interface{}{
+								"type":        "NUMBER",
+								"description": "End time of the segment in seconds.",
+							},
+							"text": map[string]interface{}{
+								"type":        "STRING",
+								"description": "The transcribed text of this segment.",
+							},
+						},
+						"required": []string{"start", "end", "text"},
+					},
+				},
+			},
+			"required": []string{"text", "segments"},
+		}
+	}
+
+	if len(generationConfig) > 0 {
+		geminiReq["generationConfig"] = generationConfig
+	}
+
+	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
+	for _, configMap := range route.ModelProvider.RequestBody.Extra {
+		deepMerge(geminiReq, configMap)
+	}
+
+	return json.Marshal(geminiReq)
+}
+
+func formatDurationSRT(seconds float64) string {
+	h := int(seconds) / 3600
+	m := (int(seconds) % 3600) / 60
+	s := int(seconds) % 60
+	ms := int((seconds - float64(int(seconds))) * 1000)
+	return fmt.Sprintf("%02d:%02d:%02d,%03d", h, m, s, ms)
+}
+
+func formatDurationVTT(seconds float64) string {
+	h := int(seconds) / 3600
+	m := (int(seconds) % 3600) / 60
+	s := int(seconds) % 60
+	ms := int((seconds - float64(int(seconds))) * 1000)
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
+}
+
+type GeminiTranscribeStructured struct {
+	Text     string `json:"text"`
+	Segments []struct {
+		Start float64 `json:"start"`
+		End   float64 `json:"end"`
+		Text  string  `json:"text"`
+	} `json:"segments"`
+}
+
+func ProcessGeminiTranscriptionResponse(rawResp []byte, hasTimestamps bool, language string, responseFormat string) ([]byte, error) {
+	var geminiResp map[string]interface{}
+	if err := json.Unmarshal(rawResp, &geminiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse Gemini response: %w", err)
+	}
+
+	candidates, ok := geminiResp["candidates"].([]interface{})
+	if !ok || len(candidates) == 0 {
+		return nil, errors.New("no candidates in Gemini response")
+	}
+
+	candMap, ok := candidates[0].(map[string]interface{})
+	if !ok {
+		return nil, errors.New("invalid candidate format")
+	}
+
+	content, ok := candMap["content"].(map[string]interface{})
+	if !ok {
+		return nil, errors.New("missing content in candidate")
+	}
+
+	parts, ok := content["parts"].([]interface{})
+	if !ok || len(parts) == 0 {
+		return nil, errors.New("no parts in candidate content")
+	}
+
+	partMap, ok := parts[0].(map[string]interface{})
+	if !ok {
+		return nil, errors.New("invalid part format")
+	}
+
+	textVal, ok := partMap["text"].(string)
+	if !ok {
+		return nil, errors.New("missing text in candidate part")
+	}
+
+	responseFormat = strings.ToLower(responseFormat)
+
+	if hasTimestamps {
+		var structuredResp GeminiTranscribeStructured
+		if err := json.Unmarshal([]byte(textVal), &structuredResp); err != nil {
+			return nil, fmt.Errorf("failed to parse structured transcription JSON from Gemini: %w", err)
+		}
+
+		if responseFormat == "srt" {
+			var srtBuilder strings.Builder
+			for i, seg := range structuredResp.Segments {
+				srtBuilder.WriteString(fmt.Sprintf("%d\n", i+1))
+				srtBuilder.WriteString(fmt.Sprintf("%s --> %s\n", formatDurationSRT(seg.Start), formatDurationSRT(seg.End)))
+				srtBuilder.WriteString(fmt.Sprintf("%s\n\n", strings.TrimSpace(seg.Text)))
+			}
+			return []byte(srtBuilder.String()), nil
+		}
+
+		if responseFormat == "vtt" {
+			var vttBuilder strings.Builder
+			vttBuilder.WriteString("WEBVTT\n\n")
+			for i, seg := range structuredResp.Segments {
+				vttBuilder.WriteString(fmt.Sprintf("%d\n", i+1))
+				vttBuilder.WriteString(fmt.Sprintf("%s --> %s\n", formatDurationVTT(seg.Start), formatDurationVTT(seg.End)))
+				vttBuilder.WriteString(fmt.Sprintf("%s\n\n", strings.TrimSpace(seg.Text)))
+			}
+			return []byte(vttBuilder.String()), nil
+		}
+
+		if responseFormat == "text" {
+			return []byte(structuredResp.Text), nil
+		}
+
+		// Otherwise, it's json or verbose_json
+		if responseFormat == "verbose_json" {
+			type OpenAISegment struct {
+				ID               int       `json:"id"`
+				Seek             int       `json:"seek"`
+				Start            float64   `json:"start"`
+				End              float64   `json:"end"`
+				Text             string    `json:"text"`
+				Tokens           []int     `json:"tokens"`
+				Temperature      float64   `json:"temperature"`
+				AvgLogprob       float64   `json:"avg_logprob"`
+				CompressionRatio float64   `json:"compression_ratio"`
+				NoSpeechProb     float64   `json:"no_speech_prob"`
+			}
+
+			segments := make([]OpenAISegment, 0, len(structuredResp.Segments))
+			var maxDuration float64
+			for i, seg := range structuredResp.Segments {
+				segments = append(segments, OpenAISegment{
+					ID:               i,
+					Seek:             0,
+					Start:            seg.Start,
+					End:              seg.End,
+					Text:             seg.Text,
+					Tokens:           []int{},
+					Temperature:      0.0,
+					AvgLogprob:       0.0,
+					CompressionRatio: 0.0,
+					NoSpeechProb:     0.0,
+				})
+				if seg.End > maxDuration {
+					maxDuration = seg.End
+				}
+			}
+
+			if language == "" {
+				language = "english"
+			}
+
+			openAIResp := map[string]interface{}{
+				"task":     "transcribe",
+				"language": language,
+				"duration": maxDuration,
+				"text":     structuredResp.Text,
+				"segments": segments,
+				"usage": map[string]interface{}{
+					"type":    "duration",
+					"seconds": int(maxDuration + 0.5),
+				},
+			}
+			return json.Marshal(openAIResp)
+		}
+
+		// standard "json" with timestamps parameter specified but format is "json"
+		openAIResp := map[string]interface{}{
+			"text": structuredResp.Text,
+		}
+		return json.Marshal(openAIResp)
+	}
+
+	// Simple plain-text response (hasTimestamps is false)
+	if responseFormat == "text" || responseFormat == "srt" || responseFormat == "vtt" {
+		return []byte(textVal), nil
+	}
+
+	// Return json format
+	openAIResp := map[string]interface{}{
+		"text": textVal,
+	}
+	return json.Marshal(openAIResp)
+}
+
+type GeminiSTTUsage struct {
+	PromptTokens     int
+	CandidatesTokens int
+	TotalTokens      int
+	AudioTokens      int
+	TextTokens       int
+}
+
+func ProcessGeminiSTTStreamLine(line []byte) (string, *GeminiSTTUsage, error) {
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return "", nil, nil
+	}
+
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	payloadStr := string(payload)
+	if payloadStr == "[DONE]" {
+		return "", nil, io.EOF
+	}
+
+	var geminiResp map[string]interface{}
+	if err := json.Unmarshal(payload, &geminiResp); err != nil {
+		return "", nil, err
+	}
+
+	var usage *GeminiSTTUsage
+	if usageMeta, ok := geminiResp["usageMetadata"].(map[string]interface{}); ok {
+		usage = &GeminiSTTUsage{}
+		if pt, ok := usageMeta["promptTokenCount"].(float64); ok {
+			usage.PromptTokens = int(pt)
+		}
+		if ct, ok := usageMeta["candidatesTokenCount"].(float64); ok {
+			usage.CandidatesTokens = int(ct)
+		}
+		if tt, ok := usageMeta["totalTokenCount"].(float64); ok {
+			usage.TotalTokens = int(tt)
+		}
+		if details, ok := usageMeta["promptTokensDetails"].([]interface{}); ok {
+			for _, det := range details {
+				if dMap, ok := det.(map[string]interface{}); ok {
+					mod, _ := dMap["modality"].(string)
+					tc, _ := dMap["tokenCount"].(float64)
+					if mod == "AUDIO" {
+						usage.AudioTokens = int(tc)
+					} else if mod == "TEXT" {
+						usage.TextTokens = int(tc)
+					}
+				}
+			}
+		}
+	}
+
+	candidates, ok := geminiResp["candidates"].([]interface{})
+	if !ok || len(candidates) == 0 {
+		return "", usage, nil
+	}
+
+	candMap, ok := candidates[0].(map[string]interface{})
+	if !ok {
+		return "", usage, nil
+	}
+
+	content, ok := candMap["content"].(map[string]interface{})
+	if !ok {
+		return "", usage, nil
+	}
+
+	parts, ok := content["parts"].([]interface{})
+	if !ok || len(parts) == 0 {
+		return "", usage, nil
+	}
+
+	partMap, ok := parts[0].(map[string]interface{})
+	if !ok {
+		return "", usage, nil
+	}
+
+	textVal, _ := partMap["text"].(string)
+	return textVal, usage, nil
 }

@@ -63,6 +63,7 @@ func main() {
 	http.HandleFunc("/v1/images/generations", handleImageGenerations(cfg, stateMgr, router, proxyMgr))
 	http.HandleFunc("/v1/images/edits", handleImageEdits(cfg, stateMgr, router, proxyMgr))
 	http.HandleFunc("/v1/audio/speech", handleAudioSpeech(cfg, stateMgr, router, proxyMgr))
+	http.HandleFunc("/v1/audio/transcriptions", handleAudioTranscriptions(cfg, stateMgr, router, proxyMgr))
 
 	fmt.Printf("[INFO] [%s] Server starting, listening on %s\n", time.Now().Format("2006-01-02 15:04:05.000"), cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, nil); err != nil {
@@ -227,6 +228,7 @@ func executeUpstreamRequest(
 		reqJSON["n"] = r.FormValue("n")
 		reqJSON["size"] = r.FormValue("size")
 		reqJSON["response_format"] = r.FormValue("response_format")
+		reqJSON["stream"] = r.FormValue("stream") == "true" || r.FormValue("stream") == "1"
 	} else {
 		if err := json.Unmarshal(rawBody, &reqJSON); err != nil {
 			http.Error(w, `{"error": {"message": "Invalid JSON in request body"}}`, http.StatusBadRequest)
@@ -274,7 +276,7 @@ func executeUpstreamRequest(
 		targetURL := route.ModelProvider.Upstream
 		if route.ModelProvider.ApiType == "gemini" {
 			isImageGen := strings.Contains(r.URL.Path, "/images/")
-			isAudioSpeech := strings.Contains(r.URL.Path, "/audio/")
+			isAudioSpeech := strings.Contains(r.URL.Path, "/audio/speech")
 			u := targetURL
 			if !strings.HasSuffix(u, "/") {
 				u += "/"
@@ -709,6 +711,189 @@ func handleAudioSpeech(cfg *Config, stateMgr *StateManager, router *Router, prox
 		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Speech)\n",
+			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
+	}
+}
+
+func handleAudioTranscriptions(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bodyModifier := func(rawBody []byte, route *SelectedRoute, req *http.Request) ([]byte, string, error) {
+			return ModifyAudioTranscriptionRequestBody(rawBody, route, req, cfg, proxyMgr)
+		}
+
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, bodyModifier)
+		if !ok {
+			return
+		}
+		defer resp.Body.Close()
+
+		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+
+		var respBody io.Reader = resp.Body
+		if debug && isSSE {
+			respBody = &loggingReader{r: resp.Body}
+		}
+
+		// 10. Copy headers back to client
+		for k, vv := range resp.Header {
+			if k == "Content-Length" {
+				continue
+			}
+			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
+				continue
+			}
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+
+		var writer io.Writer = w
+		if flusher, ok := w.(http.Flusher); ok {
+			writer = flushingWriter{w: w, f: flusher}
+		}
+
+		responseFormat := r.FormValue("response_format")
+		if isSSE {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.WriteHeader(resp.StatusCode)
+
+			reader := bufio.NewReader(respBody)
+			if route.ModelProvider.ApiType == "gemini" {
+				var fullText strings.Builder
+				var finalUsage *GeminiSTTUsage
+				for {
+					line, err := reader.ReadBytes('\n')
+					if len(line) > 0 {
+						delta, usage, processErr := ProcessGeminiSTTStreamLine(line)
+						if processErr == io.EOF {
+							break
+						}
+						if usage != nil {
+							finalUsage = usage
+						}
+						if processErr == nil && delta != "" {
+							fullText.WriteString(delta)
+							deltaChunk := map[string]interface{}{
+								"type": "transcript.text.delta",
+								"delta": delta,
+								"logprobs": []interface{}{},
+							}
+							b, _ := json.Marshal(deltaChunk)
+							_, _ = writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(b))))
+						}
+					}
+					if err != nil {
+						break
+					}
+				}
+
+				inputTokens := 0
+				outputTokens := 0
+				totalTokens := 0
+				audioTokens := 0
+				textTokens := 0
+				if finalUsage != nil {
+					inputTokens = finalUsage.PromptTokens
+					outputTokens = finalUsage.CandidatesTokens
+					totalTokens = finalUsage.TotalTokens
+					audioTokens = finalUsage.AudioTokens
+					textTokens = finalUsage.TextTokens
+				}
+
+				// Send the final "done" message
+				doneChunk := map[string]interface{}{
+					"type": "transcript.text.done",
+					"text": fullText.String(),
+					"logprobs": []interface{}{},
+					"usage": map[string]interface{}{
+						"input_tokens": inputTokens,
+						"input_token_details": map[string]interface{}{
+							"text_tokens": textTokens,
+							"audio_tokens": audioTokens,
+						},
+						"output_tokens": outputTokens,
+						"total_tokens": totalTokens,
+					},
+				}
+				b, _ := json.Marshal(doneChunk)
+				_, _ = writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(b))))
+				_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+			} else {
+				// Standard proxy streaming for non-Gemini upstreams
+				for {
+					line, err := reader.ReadBytes('\n')
+					if len(line) > 0 {
+						_, _ = writer.Write(line)
+					}
+					if err != nil {
+						break
+					}
+				}
+			}
+		} else {
+			// Set the correct Content-Type for non-streaming formats
+			rfLower := strings.ToLower(responseFormat)
+			if rfLower == "text" || rfLower == "srt" || rfLower == "vtt" {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			} else {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			}
+
+			rawResp, err := io.ReadAll(resp.Body)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+
+			if resp.StatusCode == 400 {
+				fmt.Printf("[WARN] Upstream returned HTTP 400. Response body:\n%s\n", string(rawResp))
+			}
+
+			if debug {
+				bodyStr := string(rawResp)
+				if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+					bodyStr = FormatJSON(rawResp)
+				}
+				fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
+			}
+
+			var modified []byte
+			if route.ModelProvider.ApiType == "gemini" {
+				var hasTimestamps bool
+				if rfLower == "verbose_json" || rfLower == "srt" || rfLower == "vtt" {
+					hasTimestamps = true
+				}
+				if r.MultipartForm != nil {
+					for _, val := range r.MultipartForm.Value["timestamp_granularities[]"] {
+						if val == "segment" {
+							hasTimestamps = true
+						}
+					}
+					for _, val := range r.MultipartForm.Value["timestamp_granularities"] {
+						if val == "segment" {
+							hasTimestamps = true
+						}
+					}
+				}
+
+				language := r.FormValue("language")
+				modified, err = ProcessGeminiTranscriptionResponse(rawResp, hasTimestamps, language, responseFormat)
+				if err != nil {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+			} else {
+				modified = rawResp
+			}
+
+			w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(modified)
+		}
+
+		// Access logging
+		elapsed := time.Since(startTime)
+		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Transcription)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
 	}
 }
