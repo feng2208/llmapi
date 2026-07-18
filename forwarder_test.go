@@ -1528,7 +1528,8 @@ func TestAudioSpeechTranslation(t *testing.T) {
 		"input": "Hello world from the speech generator!",
 		"voice": "alloy",
 		"speed": 1.5,
-		"response_format": "mp3"
+		"response_format": "mp3",
+		"instructions": "Speak in a cheerful and positive tone."
 	}`)
 
 	route := &SelectedRoute{
@@ -1547,6 +1548,17 @@ func TestAudioSpeechTranslation(t *testing.T) {
 	var parsed map[string]interface{}
 	if err := json.Unmarshal(translated, &parsed); err != nil {
 		t.Fatalf("Failed to parse translated request JSON: %v", err)
+	}
+
+	// Verify systemInstruction
+	sysInst, ok := parsed["systemInstruction"].(map[string]interface{})
+	if !ok {
+		t.Errorf("Expected systemInstruction to be set")
+	} else {
+		sysParts := sysInst["parts"].([]interface{})
+		if len(sysParts) != 1 || sysParts[0].(map[string]interface{})["text"] != "Speak in a cheerful and positive tone." {
+			t.Errorf("Expected systemInstruction 'Speak in a cheerful and positive tone.', got %v", sysParts)
+		}
 	}
 
 	// Verify input text and speed tag prefix

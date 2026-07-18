@@ -1455,6 +1455,17 @@ func TransformAudioSpeechRequestToGemini(rawBody []byte, route *SelectedRoute) (
 		},
 	}
 
+	instructions, _ := body["instructions"].(string)
+	if instructions != "" {
+		geminiReq["systemInstruction"] = map[string]interface{}{
+			"parts": []interface{}{
+				map[string]interface{}{
+					"text": instructions,
+				},
+			},
+		}
+	}
+
 	generationConfig := map[string]interface{}{
 		"responseModalities": []string{"AUDIO"},
 		"speechConfig": map[string]interface{}{
