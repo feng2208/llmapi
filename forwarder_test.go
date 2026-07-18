@@ -236,7 +236,7 @@ func TestModifyRequestBody(t *testing.T) {
 	}
 
 	// 1. Test with Gemini provider (bypass should be injected)
-	modifiedGemini, _, err := ModifyRequestBody(rawJSON, routeGemini, nil)
+	modifiedGemini, _, err := ModifyRequestBody(rawJSON, routeGemini, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to modify body for gemini: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestModifyRequestBody(t *testing.T) {
 		},
 	}
 
-	modifiedOther, _, err := ModifyRequestBody(rawJSON, routeOther, nil)
+	modifiedOther, _, err := ModifyRequestBody(rawJSON, routeOther, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to modify body for other: %v", err)
 	}
@@ -549,7 +549,7 @@ func TestGeminiTranslation(t *testing.T) {
 		t.Fatalf("Failed to marshal OpenAI request: %v", err)
 	}
 
-	translatedBytes, err := TransformRequestToGemini(reqBytes, route)
+	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("TransformRequestToGemini failed: %v", err)
 	}
@@ -1177,7 +1177,7 @@ func TestGeminiTranslationBypass(t *testing.T) {
 		t.Fatalf("Failed to marshal OpenAI request: %v", err)
 	}
 
-	translatedBytes, err := TransformRequestToGemini(reqBytes, route)
+	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("TransformRequestToGemini failed: %v", err)
 	}
@@ -1958,6 +1958,168 @@ func TestProcessGeminiSTTStreamLine(t *testing.T) {
 	_, _, err = ProcessGeminiSTTStreamLine(doneLine)
 	if err != io.EOF {
 		t.Errorf("Expected io.EOF on [DONE], got %v", err)
+	}
+}
+
+func TestTransformRequestToGemini_InputAudio(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+		},
+	}
+
+	openAIReq := map[string]interface{}{
+		"model": "gpt-4o",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": "What is in this recording?",
+					},
+					map[string]interface{}{
+						"type": "input_audio",
+						"input_audio": map[string]interface{}{
+							"data":   "UklGRgAAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=", // valid tiny wav base64
+							"format": "wav",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	reqBytes, err := json.Marshal(openAIReq)
+	if err != nil {
+		t.Fatalf("Failed to marshal OpenAI request: %v", err)
+	}
+
+	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(translatedBytes, &geminiReq); err != nil {
+		t.Fatalf("Failed to unmarshal translated Gemini request: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) != 1 {
+		t.Fatalf("Expected 1 item in contents, got %v", len(contents))
+	}
+
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("Expected 2 parts, got %d", len(parts))
+	}
+
+	inlineData, ok := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected inline_data part, got %v", parts[1])
+	}
+
+	if inlineData["mime_type"] != "audio/wav" {
+		t.Errorf("Expected audio/wav mime_type, got %v", inlineData["mime_type"])
+	}
+}
+
+func TestTransformRequestToGemini_File(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+		},
+	}
+
+	openAIReq := map[string]interface{}{
+		"model": "gpt-4o",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": "What is in this file?",
+					},
+					map[string]interface{}{
+						"type": "file",
+						"file": map[string]interface{}{
+							"file_data": "JVBERi0xLjQK",
+							"filename":  "report.pdf",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	reqBytes, err := json.Marshal(openAIReq)
+	if err != nil {
+		t.Fatalf("Failed to marshal OpenAI request: %v", err)
+	}
+
+	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(translatedBytes, &geminiReq); err != nil {
+		t.Fatalf("Failed to unmarshal translated Gemini request: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) != 1 {
+		t.Fatalf("Expected 1 item in contents, got %v", len(contents))
+	}
+
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("Expected 2 parts, got %d", len(parts))
+	}
+
+	inlineData, ok := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected inline_data part, got %v", parts[1])
+	}
+
+	if inlineData["mime_type"] != "application/pdf" {
+		t.Errorf("Expected application/pdf mime_type, got %v", inlineData["mime_type"])
+	}
+}
+
+func TestDetectMimeTypeFromContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected string
+	}{
+		{"PDF", []byte("%PDF-1.4\n..."), "application/pdf"},
+		{"PNG", []byte("\x89PNG\r\n\x1a\nblah"), "image/png"},
+		{"JPEG", []byte("\xff\xd8\xff\xe0\x00\x10JFIF"), "image/jpeg"},
+		{"GIF", []byte("GIF89a..."), "image/gif"},
+		{"BMP", []byte("BM..."), "image/bmp"},
+		{"FLAC", []byte("fLaC..."), "audio/flac"},
+		{"OGG", []byte("OggS..."), "audio/ogg"},
+		{"MP3_ID3", []byte("ID3..."), "audio/mp3"},
+		{"MP3_FrameSync", []byte{0xff, 0xfb, 0x00, 0x00}, "audio/mp3"},
+		{"WAV", []byte("RIFF\x00\x00\x00\x00WAVE..."), "audio/wav"},
+		{"AVI", []byte("RIFF\x00\x00\x00\x00AVI ..."), "video/avi"},
+		{"MP4", append([]byte("\x00\x00\x00\x18ftypmp42"), []byte("isommp42")...), "video/mp4"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectMimeTypeFromContent(tc.data)
+			if got != tc.expected {
+				t.Errorf("Expected %q, got %q", tc.expected, got)
+			}
+		})
 	}
 }
 

@@ -386,7 +386,10 @@ func executeUpstreamRequest(
 
 func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyRequestBody)
+		bodyModifier := func(rawBody []byte, route *SelectedRoute, req *http.Request) ([]byte, string, error) {
+			return ModifyRequestBody(rawBody, route, req, cfg, proxyMgr)
+		}
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, bodyModifier)
 		if !ok {
 			return
 		}

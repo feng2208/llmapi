@@ -119,7 +119,152 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 	return cleaned
 }
 
-func TransformRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+func detectMimeTypeFromContent(data []byte) string {
+	if len(data) < 4 {
+		return "application/octet-stream"
+	}
+
+	// PDF: %PDF
+	if bytes.HasPrefix(data, []byte("%PDF")) {
+		return "application/pdf"
+	}
+
+	// PNG
+	if bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		return "image/png"
+	}
+
+	// JPEG
+	if bytes.HasPrefix(data, []byte("\xff\xd8\xff")) {
+		return "image/jpeg"
+	}
+
+	// GIF: GIF8
+	if bytes.HasPrefix(data, []byte("GIF8")) {
+		return "image/gif"
+	}
+
+	// BMP: BM
+	if bytes.HasPrefix(data, []byte("BM")) {
+		return "image/bmp"
+	}
+
+	// FLAC: fLaC
+	if bytes.HasPrefix(data, []byte("fLaC")) {
+		return "audio/flac"
+	}
+
+	// OGG: OggS
+	if bytes.HasPrefix(data, []byte("OggS")) {
+		return "audio/ogg"
+	}
+
+	// WEBM: EBML header \x1A\x45\xDF\xA3
+	if bytes.HasPrefix(data, []byte("\x1a\x45\xdf\xa3")) {
+		return "video/webm"
+	}
+
+	// FLV: FLV\x01
+	if bytes.HasPrefix(data, []byte("FLV\x01")) {
+		return "video/x-flv"
+	}
+
+	// MP3: ID3 or frame sync
+	if bytes.HasPrefix(data, []byte("ID3")) {
+		return "audio/mp3"
+	}
+	if len(data) >= 2 && data[0] == 0xff && (data[1]&0xe0) == 0xe0 {
+		return "audio/mp3"
+	}
+
+	// MPEG: \x00\x00\x01\xBA or \x00\x00\x01\xB3
+	if bytes.HasPrefix(data, []byte("\x00\x00\x01\xba")) || bytes.HasPrefix(data, []byte("\x00\x00\x01\xb3")) {
+		return "video/mpeg"
+	}
+
+	// WMV / ASF: \x30\x26\xB2\x75\x8E\x66\xCF\x11
+	if bytes.HasPrefix(data, []byte("\x30\x26\xb2\x75\x8e\x66\xcf\x11")) {
+		return "video/wmv"
+	}
+
+	// RIFF container checks (WAV, WEBP, AVI)
+	if bytes.HasPrefix(data, []byte("RIFF")) && len(data) >= 12 {
+		container := string(data[8:12])
+		switch container {
+		case "WAVE":
+			return "audio/wav"
+		case "WEBP":
+			return "image/webp"
+		case "AVI ":
+			return "video/avi"
+		}
+	}
+
+	// FORM container checks (AIFF)
+	if bytes.HasPrefix(data, []byte("FORM")) && len(data) >= 12 {
+		container := string(data[8:12])
+		if container == "AIFF" || container == "AIFC" {
+			return "audio/aiff"
+		}
+	}
+
+	// MP4 / 3GPP checks via ftyp box
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		box := string(data[8:12])
+		if strings.HasPrefix(box, "mp4") || strings.HasPrefix(box, "isom") || strings.HasPrefix(box, "avc1") {
+			return "video/mp4"
+		}
+		if strings.HasPrefix(box, "3gp") {
+			return "video/3gpp"
+		}
+	}
+
+	// Fallback to standard Go content type detection
+	detected := http.DetectContentType(data)
+	if detected != "application/octet-stream" {
+		return detected
+	}
+
+	return "application/octet-stream"
+}
+
+func detectMimeType(filename string) string {
+	idx := strings.LastIndex(filename, ".")
+	if idx == -1 || idx == len(filename)-1 {
+		return "application/octet-stream"
+	}
+	ext := strings.ToLower(filename[idx+1:])
+	switch ext {
+	case "pdf":
+		return "application/pdf"
+	case "txt":
+		return "text/plain"
+	case "csv":
+		return "text/csv"
+	case "html", "htm":
+		return "text/html"
+	case "json":
+		return "application/json"
+	case "mp3":
+		return "audio/mp3"
+	case "wav":
+		return "audio/wav"
+	case "m4a":
+		return "audio/m4a"
+	case "mp4":
+		return "video/mp4"
+	case "mov":
+		return "video/quicktime"
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Request, cfg *Config, proxyMgr *ProxyManager) ([]byte, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
@@ -181,7 +326,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, err
 
 		var parts []GeminiPart
 
-		// Handle content (text, image)
+		// Handle content (text, image, audio, file)
 		if role != "tool" {
 			if txt, ok := content.(string); ok && txt != "" {
 				parts = append(parts, map[string]interface{}{"text": txt})
@@ -201,6 +346,109 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, err
 										return nil, fmt.Errorf("failed to process image: %w", err)
 									}
 									parts = append(parts, part)
+								}
+							}
+						} else if itemType == "input_audio" {
+							if inputAudioMap, ok := itemMap["input_audio"].(map[string]interface{}); ok {
+								base64Data, _ := inputAudioMap["data"].(string)
+								format, _ := inputAudioMap["format"].(string)
+								if base64Data != "" {
+									dataBytes, err := base64.StdEncoding.DecodeString(base64Data)
+									if err == nil {
+										mimeType := detectMimeTypeFromContent(dataBytes)
+										if mimeType == "application/octet-stream" {
+											if format != "" {
+												mimeType = "audio/" + format
+											} else {
+												mimeType = "audio/wav"
+											}
+										}
+										if len(dataBytes) <= 20*1024*1024 {
+											parts = append(parts, map[string]interface{}{
+												"inline_data": map[string]interface{}{
+													"mime_type": mimeType,
+													"data":      base64Data,
+												},
+											})
+										} else {
+											_, fileURI, err := uploadFileToGemini(r.Context(), route.AuthKey, "audio."+format, bytes.NewReader(dataBytes), int64(len(dataBytes)), mimeType, route, cfg, proxyMgr)
+											if err != nil {
+												return nil, fmt.Errorf("failed to upload audio to Files API: %w", err)
+											}
+											parts = append(parts, map[string]interface{}{
+												"file_data": map[string]interface{}{
+													"mime_type": mimeType,
+													"file_uri":  fileURI,
+												},
+											})
+										}
+									}
+								}
+							}
+						} else if itemType == "file" {
+							if fileMap, ok := itemMap["file"].(map[string]interface{}); ok {
+								fileData, _ := fileMap["file_data"].(string)
+								filename, _ := fileMap["filename"].(string)
+								if fileData != "" {
+									base64Data := ""
+									uriMimeType := ""
+
+									if strings.HasPrefix(fileData, "data:") {
+										partsData := strings.SplitN(fileData, ",", 2)
+										if len(partsData) == 2 {
+											header := partsData[0]
+											base64Data = partsData[1]
+											if strings.Contains(header, ";") {
+												mimePart := strings.TrimPrefix(header, "data:")
+												semiIdx := strings.Index(mimePart, ";")
+												if semiIdx != -1 {
+													uriMimeType = mimePart[:semiIdx]
+												}
+											}
+										}
+									} else {
+										base64Data = fileData
+									}
+
+									if base64Data != "" {
+										dataBytes, err := base64.StdEncoding.DecodeString(base64Data)
+										if err == nil {
+											mimeType := detectMimeTypeFromContent(dataBytes)
+											if mimeType == "application/octet-stream" {
+												if uriMimeType != "" {
+													mimeType = uriMimeType
+												} else if filename != "" {
+													mimeType = detectMimeType(filename)
+												} else {
+													mimeType = "application/pdf"
+												}
+											}
+
+											displayName := filename
+											if displayName == "" {
+												displayName = "file.pdf"
+											}
+											if len(dataBytes) <= 20*1024*1024 {
+												parts = append(parts, map[string]interface{}{
+													"inline_data": map[string]interface{}{
+														"mime_type": mimeType,
+														"data":      base64Data,
+													},
+												})
+											} else {
+												_, fileURI, err := uploadFileToGemini(r.Context(), route.AuthKey, displayName, bytes.NewReader(dataBytes), int64(len(dataBytes)), mimeType, route, cfg, proxyMgr)
+												if err != nil {
+													return nil, fmt.Errorf("failed to upload file to Files API: %w", err)
+												}
+												parts = append(parts, map[string]interface{}{
+													"file_data": map[string]interface{}{
+														"mime_type": mimeType,
+														"file_uri":  fileURI,
+													},
+												})
+											}
+										}
+									}
 								}
 							}
 						}

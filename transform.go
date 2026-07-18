@@ -37,9 +37,9 @@ func applyDeleteAndExtra(body map[string]interface{}, route *SelectedRoute) {
 }
 
 // ModifyRequestBody applies the delete, extra, and model replacement rules.
-func ModifyRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
+func ModifyRequestBody(rawBody []byte, route *SelectedRoute, r *http.Request, cfg *Config, proxyMgr *ProxyManager) ([]byte, string, error) {
 	if route.ModelProvider.ApiType == "gemini" {
-		modified, err := TransformRequestToGemini(rawBody, route)
+		modified, err := TransformRequestToGemini(rawBody, route, r, cfg, proxyMgr)
 		if err != nil {
 			return nil, "", err
 		}
