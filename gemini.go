@@ -598,40 +598,36 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 	}
 
 	// 3. Map tool_choice
+	toolConfig := make(map[string]interface{})
 	if toolChoice, ok := body["tool_choice"]; ok {
 		if tcStr, ok := toolChoice.(string); ok {
 			if tcStr == "none" {
-				geminiReq["toolConfig"] = map[string]interface{}{
-					"functionCallingConfig": map[string]interface{}{
-						"mode": "NONE",
-					},
+				toolConfig["functionCallingConfig"] = map[string]interface{}{
+					"mode": "NONE",
 				}
 			} else if tcStr == "required" {
-				geminiReq["toolConfig"] = map[string]interface{}{
-					"functionCallingConfig": map[string]interface{}{
-						"mode": "ANY",
-					},
+				toolConfig["functionCallingConfig"] = map[string]interface{}{
+					"mode": "ANY",
 				}
 			} else if tcStr == "auto" {
-				geminiReq["toolConfig"] = map[string]interface{}{
-					"functionCallingConfig": map[string]interface{}{
-						"mode": "AUTO",
-					},
+				toolConfig["functionCallingConfig"] = map[string]interface{}{
+					"mode": "AUTO",
 				}
 			}
 		} else if tcMap, ok := toolChoice.(map[string]interface{}); ok {
 			if fnMap, ok := tcMap["function"].(map[string]interface{}); ok {
 				if name, ok := fnMap["name"].(string); ok && name != "" {
-					geminiReq["toolConfig"] = map[string]interface{}{
-						"functionCallingConfig": map[string]interface{}{
-							"mode":                 "ANY",
-							"allowedFunctionNames": []string{name},
-						},
+					toolConfig["functionCallingConfig"] = map[string]interface{}{
+						"mode":                 "ANY",
+						"allowedFunctionNames": []string{name},
 					}
 				}
 			}
 		}
 	}
+
+	toolConfig["includeServerSideToolInvocations"] = true
+	geminiReq["toolConfig"] = toolConfig
 
 	// 4. Map generationConfig
 	generationConfig := make(map[string]interface{})

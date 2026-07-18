@@ -655,6 +655,9 @@ func TestGeminiTranslation(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected toolConfig to be set")
 	}
+	if toolConfig["includeServerSideToolInvocations"] != true {
+		t.Errorf("Expected includeServerSideToolInvocations to be true, got %v", toolConfig["includeServerSideToolInvocations"])
+	}
 	fcConfig := toolConfig["functionCallingConfig"].(map[string]interface{})
 	if fcConfig["mode"] != "ANY" {
 		t.Errorf("Expected mode 'ANY', got %v", fcConfig["mode"])
