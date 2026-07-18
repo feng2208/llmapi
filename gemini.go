@@ -331,12 +331,14 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 			if txt, ok := content.(string); ok && txt != "" {
 				parts = append(parts, map[string]interface{}{"text": txt})
 			} else if arr, ok := content.([]interface{}); ok {
+				var fileParts []GeminiPart
+				var textParts []GeminiPart
 				for _, item := range arr {
 					if itemMap, ok := item.(map[string]interface{}); ok {
 						itemType, _ := itemMap["type"].(string)
 						if itemType == "text" {
 							if txt, ok := itemMap["text"].(string); ok && txt != "" {
-								parts = append(parts, map[string]interface{}{"text": txt})
+								textParts = append(textParts, map[string]interface{}{"text": txt})
 							}
 						} else if itemType == "image_url" {
 							if imgUrlMap, ok := itemMap["image_url"].(map[string]interface{}); ok {
@@ -345,7 +347,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 									if err != nil {
 										return nil, fmt.Errorf("failed to process image: %w", err)
 									}
-									parts = append(parts, part)
+									fileParts = append(fileParts, part)
 								}
 							}
 						} else if itemType == "input_audio" {
@@ -364,7 +366,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 											}
 										}
 										if len(dataBytes) <= 20*1024*1024 {
-											parts = append(parts, map[string]interface{}{
+											fileParts = append(fileParts, map[string]interface{}{
 												"inline_data": map[string]interface{}{
 													"mime_type": mimeType,
 													"data":      base64Data,
@@ -375,7 +377,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 											if err != nil {
 												return nil, fmt.Errorf("failed to upload audio to Files API: %w", err)
 											}
-											parts = append(parts, map[string]interface{}{
+											fileParts = append(fileParts, map[string]interface{}{
 												"file_data": map[string]interface{}{
 													"mime_type": mimeType,
 													"file_uri":  fileURI,
@@ -429,7 +431,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 												displayName = "file.pdf"
 											}
 											if len(dataBytes) <= 20*1024*1024 {
-												parts = append(parts, map[string]interface{}{
+												fileParts = append(fileParts, map[string]interface{}{
 													"inline_data": map[string]interface{}{
 														"mime_type": mimeType,
 														"data":      base64Data,
@@ -440,7 +442,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 												if err != nil {
 													return nil, fmt.Errorf("failed to upload file to Files API: %w", err)
 												}
-												parts = append(parts, map[string]interface{}{
+												fileParts = append(fileParts, map[string]interface{}{
 													"file_data": map[string]interface{}{
 														"mime_type": mimeType,
 														"file_uri":  fileURI,
@@ -454,6 +456,8 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 						}
 					}
 				}
+				parts = append(parts, fileParts...)
+				parts = append(parts, textParts...)
 			}
 		}
 
@@ -998,9 +1002,7 @@ func TransformImageRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte
 		},
 	}
 
-	generationConfig := map[string]interface{}{
-		"responseModalities": []string{"IMAGE"},
-	}
+	generationConfig := map[string]interface{}{}
 
 	if n, ok := body["n"].(float64); ok {
 		generationConfig["candidateCount"] = int(n)
@@ -1191,9 +1193,6 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 	}
 
 	var parts []interface{}
-	parts = append(parts, map[string]interface{}{
-		"text": prompt,
-	})
 
 	// Get image
 	imageKeys := []string{"image", "image[]"}
@@ -1270,6 +1269,10 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 		})
 	}
 
+	parts = append(parts, map[string]interface{}{
+		"text": prompt,
+	})
+
 	geminiReq := map[string]interface{}{
 		"contents": []interface{}{
 			map[string]interface{}{
@@ -1279,9 +1282,7 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 		},
 	}
 
-	generationConfig := map[string]interface{}{
-		"responseModalities": []string{"IMAGE"},
-	}
+	generationConfig := map[string]interface{}{}
 
 	nStr := r.FormValue("n")
 	if nStr != "" {

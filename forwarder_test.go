@@ -585,10 +585,10 @@ func TestGeminiTranslation(t *testing.T) {
 	if len(parts1) != 2 {
 		t.Fatalf("Expected 2 parts in user content, got %d", len(parts1))
 	}
-	if parts1[0].(map[string]interface{})["text"] != "What is in this image and what is the temperature in London?" {
-		t.Errorf("Expected user text part, got %v", parts1[0])
+	if parts1[1].(map[string]interface{})["text"] != "What is in this image and what is the temperature in London?" {
+		t.Errorf("Expected user text part, got %v", parts1[1])
 	}
-	inlineData := parts1[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	inlineData := parts1[0].(map[string]interface{})["inline_data"].(map[string]interface{})
 	if inlineData["mime_type"] != "image/png" || inlineData["data"] != "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" {
 		t.Errorf("Expected user inline image data, got %v", inlineData)
 	}
@@ -1295,11 +1295,11 @@ func TestModifyImageEditRequestBody(t *testing.T) {
 	if len(parts) != 2 {
 		t.Fatalf("Expected 2 parts (prompt text and inline image), got %d", len(parts))
 	}
-	promptText := parts[0].(map[string]interface{})["text"].(string)
+	promptText := parts[1].(map[string]interface{})["text"].(string)
 	if promptText != "a cute dog wearing a hat" {
 		t.Errorf("Expected prompt text 'a cute dog wearing a hat', got %q", promptText)
 	}
-	inlineData := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	inlineData := parts[0].(map[string]interface{})["inline_data"].(map[string]interface{})
 	if inlineData["mime_type"] != "image/png" {
 		t.Errorf("Expected mime_type 'image/png', got %v", inlineData["mime_type"])
 	}
@@ -1459,18 +1459,18 @@ func TestModifyImageEditRequestBody_MultipleImages(t *testing.T) {
 	if len(parts) != 3 {
 		t.Fatalf("Expected 3 parts (prompt text and 2 inline images), got %d", len(parts))
 	}
-	promptText := parts[0].(map[string]interface{})["text"].(string)
+	promptText := parts[2].(map[string]interface{})["text"].(string)
 	if promptText != "compare these two images" {
 		t.Errorf("Expected prompt text 'compare these two images', got %q", promptText)
 	}
 
 	// Verify image 1
-	img1Data := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	img1Data := parts[0].(map[string]interface{})["inline_data"].(map[string]interface{})
 	if img1Data["mime_type"] != "image/png" {
 		t.Errorf("Expected img1 mime_type 'image/png', got %v", img1Data["mime_type"])
 	}
 	// Verify image 2
-	img2Data := parts[2].(map[string]interface{})["inline_data"].(map[string]interface{})
+	img2Data := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
 	if img2Data["mime_type"] != "image/png" {
 		t.Errorf("Expected img2 mime_type 'image/png', got %v", img2Data["mime_type"])
 	}
@@ -2029,9 +2029,9 @@ func TestTransformRequestToGemini_InputAudio(t *testing.T) {
 		t.Fatalf("Expected 2 parts, got %d", len(parts))
 	}
 
-	inlineData, ok := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	inlineData, ok := parts[0].(map[string]interface{})["inline_data"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("Expected inline_data part, got %v", parts[1])
+		t.Fatalf("Expected inline_data part, got %v", parts[0])
 	}
 
 	if inlineData["mime_type"] != "audio/wav" {
@@ -2095,9 +2095,9 @@ func TestTransformRequestToGemini_File(t *testing.T) {
 		t.Fatalf("Expected 2 parts, got %d", len(parts))
 	}
 
-	inlineData, ok := parts[1].(map[string]interface{})["inline_data"].(map[string]interface{})
+	inlineData, ok := parts[0].(map[string]interface{})["inline_data"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("Expected inline_data part, got %v", parts[1])
+		t.Fatalf("Expected inline_data part, got %v", parts[0])
 	}
 
 	if inlineData["mime_type"] != "application/pdf" {
