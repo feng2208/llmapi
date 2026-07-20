@@ -35,16 +35,22 @@ type ModelConfig struct {
 }
 
 type ModelProviderConfig struct {
-	Name           string            `yaml:"name"`
-	Upstream       string            `yaml:"upstream"`
-	Model          string            `yaml:"model"`
-	RateLimit      *float64          `yaml:"rate_limit,omitempty"` // Requests per minute (optional, independent)
-	TimeoutStr     string            `yaml:"timeout"`              // e.g. "120s"
-	Proxy          string            `yaml:"proxy"`
-	ReasoningStart string            `yaml:"reasoning_start"`
-	ReasoningEnd   string            `yaml:"reasoning_end"`
-	RequestBody    RequestBodyConfig `yaml:"request_body"`
-	ApiType        string            `yaml:"api_type"`
+	Name           string               `yaml:"name"`
+	Upstream       string               `yaml:"upstream"`
+	Model          string               `yaml:"model"`
+	RateLimit      *float64             `yaml:"rate_limit,omitempty"` // Requests per minute (optional, independent)
+	TimeoutStr     string               `yaml:"timeout"`              // e.g. "120s"
+	Proxy          string               `yaml:"proxy"`
+	ReasoningStart string               `yaml:"reasoning_start"`
+	ReasoningEnd   string               `yaml:"reasoning_end"`
+	RequestHeaders RequestHeadersConfig `yaml:"request_headers"`
+	RequestBody    RequestBodyConfig    `yaml:"request_body"`
+	ApiType        string               `yaml:"api_type"`
+}
+
+type RequestHeadersConfig struct {
+	Delete []string                 `yaml:"delete"`
+	Extra  []map[string]interface{} `yaml:"extra"`
 }
 
 type RequestBodyConfig struct {

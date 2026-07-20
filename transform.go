@@ -513,3 +513,28 @@ func ModifyAudioTranscriptionRequestBody(rawBody []byte, route *SelectedRoute, r
 	}
 	return modifiedBody, contentType, nil
 }
+
+// ModifyRequestHeaders applies configured request header deletions and additions/merges.
+func ModifyRequestHeaders(req *http.Request, route *SelectedRoute) {
+	for _, hName := range route.ModelProvider.RequestHeaders.Delete {
+		req.Header.Del(hName)
+	}
+	for _, extraMap := range route.ModelProvider.RequestHeaders.Extra {
+		for k, v := range extraMap {
+			valStr := fmt.Sprintf("%v", v)
+			canonicalKey := http.CanonicalHeaderKey(k)
+			existing := req.Header[canonicalKey]
+			if len(existing) == 0 {
+				req.Header.Set(canonicalKey, valStr)
+			} else {
+				if canonicalKey == "Cookie" {
+					combined := strings.Join(existing, "; ")
+					req.Header.Set(canonicalKey, combined+"; "+valStr)
+				} else {
+					combined := strings.Join(existing, ", ")
+					req.Header.Set(canonicalKey, combined+", "+valStr)
+				}
+			}
+		}
+	}
+}

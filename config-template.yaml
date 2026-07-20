@@ -26,6 +26,11 @@ models:
         proxy: socks5://127.0.0.1:1080
         reasoning_start: "<thought>"
         reasoning_end: "</thought>"
+        request_headers:
+          delete:
+            - bad_header
+          extra:
+            - Cookie: mycookie=hello
         request_body:
           delete:
             - reasoning_effort

@@ -326,6 +326,9 @@ func executeUpstreamRequest(
 		}
 		upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
 
+		// Apply custom request header rules from configuration
+		ModifyRequestHeaders(upstreamReq, route)
+
 		if debug {
 			fmt.Printf("[DEBUG] --- OUTGOING REQUEST (attempt %d/%d) ---\n", attempt+1, maxRetries+1)
 			fmt.Printf("[DEBUG] Target URL: %s\n", upstreamReq.URL.String())

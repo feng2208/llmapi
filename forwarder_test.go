@@ -39,6 +39,13 @@ func TestLoadConfig(t *testing.T) {
 
 	// Verify request_body configurations
 	modelProv := cfg.Models[0].Providers[0]
+	if len(modelProv.RequestHeaders.Delete) != 1 || modelProv.RequestHeaders.Delete[0] != "bad_header" {
+		t.Errorf("Expected request_headers.delete to contain ['bad_header'], got %v", modelProv.RequestHeaders.Delete)
+	}
+	if len(modelProv.RequestHeaders.Extra) != 1 || modelProv.RequestHeaders.Extra[0]["Cookie"] != "mycookie=hello" {
+		t.Errorf("Expected request_headers.extra to contain Cookie, got %v", modelProv.RequestHeaders.Extra)
+	}
+
 	if len(modelProv.RequestBody.Delete) == 0 {
 		t.Error("Expected delete config to have items")
 	}
@@ -2135,6 +2142,56 @@ func TestDetectMimeTypeFromContent(t *testing.T) {
 				t.Errorf("Expected %q, got %q", tc.expected, got)
 			}
 		})
+	}
+}
+
+func TestModifyRequestHeaders(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			RequestHeaders: RequestHeadersConfig{
+				Delete: []string{"X-Bad-Header", "Content-Type"},
+				Extra: []map[string]interface{}{
+					{"Cookie": "session=abc"},
+					{"X-Custom-Header": "hello"},
+					{"X-Merged-Header": "extra1"},
+				},
+			},
+		},
+	}
+
+	req, err := http.NewRequest("POST", "http://localhost", nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+
+	req.Header.Set("X-Bad-Header", "should-be-deleted")
+	req.Header.Set("Content-Type", "should-be-deleted")
+	req.Header.Set("Cookie", "init=123")
+	req.Header.Set("X-Merged-Header", "init1")
+
+	ModifyRequestHeaders(req, route)
+
+	// Check deleted headers
+	if v := req.Header.Get("X-Bad-Header"); v != "" {
+		t.Errorf("Expected X-Bad-Header to be deleted, got %q", v)
+	}
+	if v := req.Header.Get("Content-Type"); v != "" {
+		t.Errorf("Expected Content-Type to be deleted, got %q", v)
+	}
+
+	// Check custom new header
+	if v := req.Header.Get("X-Custom-Header"); v != "hello" {
+		t.Errorf("Expected X-Custom-Header to be 'hello', got %q", v)
+	}
+
+	// Check merged Cookie with "; "
+	if v := req.Header.Get("Cookie"); v != "init=123; session=abc" {
+		t.Errorf("Expected Cookie to be 'init=123; session=abc', got %q", v)
+	}
+
+	// Check merged standard header with ", "
+	if v := req.Header.Get("X-Merged-Header"); v != "init1, extra1" {
+		t.Errorf("Expected X-Merged-Header to be 'init1, extra1', got %q", v)
 	}
 }
 
