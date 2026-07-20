@@ -318,7 +318,10 @@ func executeUpstreamRequest(
 		upstreamReq.Header.Set("Content-Type", contentTypeOut)
 
 		// Swap Authorization with chosen upstream auth key
-		if route.ModelProvider.ApiType == "gemini" {
+		if route.AuthKey == "sk-dummy" {
+			upstreamReq.Header.Del("Authorization")
+			upstreamReq.Header.Del("x-goog-api-key")
+		} else if route.ModelProvider.ApiType == "gemini" {
 			upstreamReq.Header.Set("x-goog-api-key", route.AuthKey)
 			upstreamReq.Header.Del("Authorization")
 		} else {
