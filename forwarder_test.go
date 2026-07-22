@@ -646,6 +646,9 @@ func TestGeminiTranslation(t *testing.T) {
 		t.Errorf("Expected get_current_temperature function declaration, got %v", fd)
 	}
 	params := fd[0].(map[string]interface{})["parameters"].(map[string]interface{})
+	if params["type"] != "OBJECT" {
+		t.Errorf("Expected root parameters type 'OBJECT', got %v", params["type"])
+	}
 	if _, ok := params["$schema"]; ok {
 		t.Errorf("Expected '$schema' to be cleaned from parameters")
 	}
@@ -653,6 +656,9 @@ func TestGeminiTranslation(t *testing.T) {
 		t.Errorf("Expected 'additionalProperties' to be cleaned from parameters")
 	}
 	locationProp := params["properties"].(map[string]interface{})["location"].(map[string]interface{})
+	if locationProp["type"] != "STRING" {
+		t.Errorf("Expected property type 'STRING', got %v", locationProp["type"])
+	}
 	if _, ok := locationProp["additionalProperties"]; ok {
 		t.Errorf("Expected nested 'additionalProperties' to be cleaned from location properties")
 	}

@@ -98,8 +98,16 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 			continue
 		}
 
-		// Recursively clean sub-schemas (e.g. properties, items)
-		if k == "properties" {
+		// Convert type values to uppercase (e.g. object -> OBJECT, integer -> INTEGER, string -> STRING)
+		if k == "type" {
+			if typeStr, ok := v.(string); ok {
+				cleaned[k] = strings.ToUpper(typeStr)
+				continue
+			}
+		}
+
+		// Recursively clean sub-schemas (e.g. properties, $defs, definitions)
+		if k == "properties" || k == "$defs" || k == "definitions" {
 			if propsMap, ok := v.(map[string]interface{}); ok {
 				cleanedProps := make(map[string]interface{})
 				for propName, propVal := range propsMap {
@@ -109,9 +117,32 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 				continue
 			}
 		}
+
+		// Recursively clean items
 		if k == "items" {
-			cleaned[k] = cleanGeminiSchema(v)
-			continue
+			if itemMap, ok := v.(map[string]interface{}); ok {
+				cleaned[k] = cleanGeminiSchema(itemMap)
+				continue
+			} else if itemArr, ok := v.([]interface{}); ok {
+				cleanedArr := make([]interface{}, 0, len(itemArr))
+				for _, elem := range itemArr {
+					cleanedArr = append(cleanedArr, cleanGeminiSchema(elem))
+				}
+				cleaned[k] = cleanedArr
+				continue
+			}
+		}
+
+		// Recursively clean allOf, anyOf, oneOf, prefixItems
+		if k == "allOf" || k == "anyOf" || k == "oneOf" || k == "prefixItems" {
+			if schemaArr, ok := v.([]interface{}); ok {
+				cleanedArr := make([]interface{}, 0, len(schemaArr))
+				for _, elem := range schemaArr {
+					cleanedArr = append(cleanedArr, cleanGeminiSchema(elem))
+				}
+				cleaned[k] = cleanedArr
+				continue
+			}
 		}
 
 		cleaned[k] = v
