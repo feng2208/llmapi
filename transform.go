@@ -16,15 +16,15 @@ func applyDeleteAndExtra(body map[string]interface{}, route *SelectedRoute) {
 	// Delete Configured Keys
 	for _, item := range route.ModelProvider.RequestBody.Delete {
 		if str, ok := item.(string); ok {
-			delete(body, str)
+			deleteNestedPath(body, str)
 		} else if m, ok := item.(map[string]interface{}); ok {
 			for k := range m {
-				delete(body, k)
+				deleteNestedPath(body, k)
 			}
 		} else if m, ok := item.(map[interface{}]interface{}); ok {
 			for k := range m {
 				if s, ok := k.(string); ok {
-					delete(body, s)
+					deleteNestedPath(body, s)
 				}
 			}
 		}
@@ -33,6 +33,58 @@ func applyDeleteAndExtra(body map[string]interface{}, route *SelectedRoute) {
 	// Add/Replace Extra Fields
 	for _, extraMap := range route.ModelProvider.RequestBody.Extra {
 		deepMerge(body, extraMap)
+	}
+}
+
+// deleteNestedPath recursively traverses and deletes a key from maps and slices using dot/brackets notation (e.g. "messages[].reasoning_content").
+func deleteNestedPath(data interface{}, path string) {
+	if data == nil || path == "" {
+		return
+	}
+
+	idx := strings.Index(path, ".")
+	if idx != -1 {
+		currKey := path[:idx]
+		restPath := path[idx+1:]
+
+		// Check if current key represents an array format (e.g. "messages[]")
+		isArray := false
+		if strings.HasSuffix(currKey, "[]") {
+			currKey = strings.TrimSuffix(currKey, "[]")
+			isArray = true
+		}
+
+		if m, ok := data.(map[string]interface{}); ok {
+			val := m[currKey]
+			if isArray {
+				if slice, ok := val.([]interface{}); ok {
+					for _, item := range slice {
+						deleteNestedPath(item, restPath)
+					}
+				}
+			} else {
+				// Fallback: if user didn't write "[]" but the actual value is a slice, automatically loop
+				if slice, ok := val.([]interface{}); ok {
+					for _, item := range slice {
+						deleteNestedPath(item, restPath)
+					}
+				} else {
+					deleteNestedPath(val, restPath)
+				}
+			}
+		}
+		return
+	}
+
+	// End of path (deepest key, e.g. "reasoning_content")
+	if m, ok := data.(map[string]interface{}); ok {
+		delete(m, path)
+	} else if slice, ok := data.([]interface{}); ok {
+		for _, item := range slice {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				delete(itemMap, path)
+			}
+		}
 	}
 }
 

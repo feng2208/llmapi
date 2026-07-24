@@ -2201,4 +2201,77 @@ func TestModifyRequestHeaders(t *testing.T) {
 	}
 }
 
+func TestDeleteNestedPath(t *testing.T) {
+	bodyJSON := `{
+		"model": "gpt-4o",
+		"messages": [
+			{
+				"role": "system",
+				"content": "You must output ..."
+			},
+			{
+				"role": "user",
+				"content": "今天是星期几"
+			},
+			{
+				"role": "assistant",
+				"content": "今天是星期五。",
+				"reasoning_content": "The user is asking ..."
+			}
+		],
+		"settings": {
+			"options": {
+				"temperature": 0.5,
+				"max_tokens": 100
+			}
+		}
+	}`
+
+	var body map[string]interface{}
+	if err := json.Unmarshal([]byte(bodyJSON), &body); err != nil {
+		t.Fatalf("Failed to parse body JSON: %v", err)
+	}
+
+	// 1. Delete a nested key inside a slice with bracket syntax: messages[].reasoning_content
+	deleteNestedPath(body, "messages[].reasoning_content")
+
+	messages, ok := body["messages"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected messages to be an array")
+	}
+
+	for _, m := range messages {
+		msgMap := m.(map[string]interface{})
+		if _, ok := msgMap["reasoning_content"]; ok {
+			t.Errorf("Expected reasoning_content to be deleted from assistant message")
+		}
+	}
+
+	// 2. Delete a nested key inside a slice with auto-fallback dot syntax: messages.content
+	deleteNestedPath(body, "messages.content")
+
+	for _, m := range messages {
+		msgMap := m.(map[string]interface{})
+		if _, ok := msgMap["content"]; ok {
+			t.Errorf("Expected content to be deleted from message")
+		}
+		// role should still be there
+		if _, ok := msgMap["role"]; !ok {
+			t.Errorf("Expected role to remain intact")
+		}
+	}
+
+	// 3. Delete deep nested key: settings.options.max_tokens
+	deleteNestedPath(body, "settings.options.max_tokens")
+
+	settings := body["settings"].(map[string]interface{})
+	options := settings["options"].(map[string]interface{})
+	if _, ok := options["max_tokens"]; ok {
+		t.Errorf("Expected settings.options.max_tokens to be deleted")
+	}
+	if options["temperature"].(float64) != 0.5 {
+		t.Errorf("Expected settings.options.temperature to remain 0.5, got %v", options["temperature"])
+	}
+}
+
 
