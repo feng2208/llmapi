@@ -26,6 +26,7 @@ models:
         proxy: socks5://127.0.0.1:1080
         reasoning_start: "<thought>"
         reasoning_end: "</thought>"
+        reasoning_field: thinking
         request_headers:
           delete:
             - bad_header

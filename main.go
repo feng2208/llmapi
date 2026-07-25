@@ -458,7 +458,7 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 					}
 				}
 			} else {
-				extractor := NewStreamExtractor(route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
+				extractor := NewStreamExtractor(route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd, route.ModelProvider.ReasoningField)
 				for {
 					line, err := reader.ReadBytes('\n')
 					if len(line) > 0 {
@@ -487,7 +487,7 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 					return
 				}
 			} else {
-				modified = ProcessJSONResponse(rawResp, route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd)
+				modified = ProcessJSONResponse(rawResp, route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd, route.ModelProvider.ReasoningField)
 			}
 
 			if debug {

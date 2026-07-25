@@ -43,6 +43,7 @@ type ModelProviderConfig struct {
 	Proxy          string               `yaml:"proxy"`
 	ReasoningStart string               `yaml:"reasoning_start"`
 	ReasoningEnd   string               `yaml:"reasoning_end"`
+	ReasoningField string               `yaml:"reasoning_field"`
 	RequestHeaders RequestHeadersConfig `yaml:"request_headers"`
 	RequestBody    RequestBodyConfig    `yaml:"request_body"`
 	ApiType        string               `yaml:"api_type"`

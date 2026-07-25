@@ -193,20 +193,121 @@ func ModifyImageRequestBody(rawBody []byte, route *SelectedRoute, r *http.Reques
 type StreamExtractor struct {
 	startTag         string
 	endTag           string
+	reasoningField   string
 	fullBuffer       string
 	flushedContent   string
 	flushedReasoning string
 }
 
-func NewStreamExtractor(startTag, endTag string) *StreamExtractor {
+func NewStreamExtractor(startTag, endTag, reasoningField string) *StreamExtractor {
 	return &StreamExtractor{
-		startTag: startTag,
-		endTag:   endTag,
+		startTag:       startTag,
+		endTag:         endTag,
+		reasoningField: reasoningField,
+	}
+}
+
+func extractReasoningValue(val interface{}) string {
+	if val == nil {
+		return ""
+	}
+	if s, ok := val.(string); ok {
+		return s
+	}
+	var sb strings.Builder
+	if slice, ok := val.([]interface{}); ok {
+		for _, item := range slice {
+			if itemStr, ok := item.(string); ok {
+				sb.WriteString(itemStr)
+			} else if itemMap, ok := item.(map[string]interface{}); ok {
+				if txt, ok := itemMap["text"].(string); ok {
+					sb.WriteString(txt)
+				} else if content, ok := itemMap["content"].(string); ok {
+					sb.WriteString(content)
+				}
+			}
+		}
+		return sb.String()
+	}
+	if m, ok := val.(map[string]interface{}); ok {
+		if txt, ok := m["text"].(string); ok {
+			return txt
+		}
+		if content, ok := m["content"].(string); ok {
+			return content
+		}
+	}
+	return ""
+}
+
+func processReasoningField(container map[string]interface{}, reasoningField string) {
+	if container == nil || reasoningField == "" {
+		return
+	}
+
+	var extractedReasoning strings.Builder
+	var normalTextParts []string
+	hasContentField := false
+	contentIsArrayOrMap := false
+
+	// Case 1: Direct key on container, e.g. container["thinking"]
+	if val, ok := container[reasoningField]; ok {
+		extractedReasoning.WriteString(extractReasoningValue(val))
+		delete(container, reasoningField)
+	}
+
+	// Case 2: Inside container["content"]
+	if contentVal, ok := container["content"]; ok && contentVal != nil {
+		hasContentField = true
+		if slice, ok := contentVal.([]interface{}); ok {
+			contentIsArrayOrMap = true
+			for _, item := range slice {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					if thinkVal, ok := itemMap[reasoningField]; ok {
+						extractedReasoning.WriteString(extractReasoningValue(thinkVal))
+					} else if txt, ok := itemMap["text"].(string); ok {
+						normalTextParts = append(normalTextParts, txt)
+					} else if itemType, ok := itemMap["type"].(string); ok && itemType == "text" {
+						if txtVal, ok := itemMap["text"].(string); ok {
+							normalTextParts = append(normalTextParts, txtVal)
+						}
+					}
+				} else if itemStr, ok := item.(string); ok {
+					normalTextParts = append(normalTextParts, itemStr)
+				}
+			}
+		} else if itemMap, ok := contentVal.(map[string]interface{}); ok {
+			contentIsArrayOrMap = true
+			if thinkVal, ok := itemMap[reasoningField]; ok {
+				extractedReasoning.WriteString(extractReasoningValue(thinkVal))
+			} else if txt, ok := itemMap["text"].(string); ok {
+				normalTextParts = append(normalTextParts, txt)
+			}
+		}
+	}
+
+	// If we extracted reasoning text:
+	if extractedReasoning.Len() > 0 {
+		rText := extractedReasoning.String()
+		container["reasoning"] = rText
+		container["reasoning_content"] = rText
+
+		if contentIsArrayOrMap {
+			if len(normalTextParts) > 0 {
+				container["content"] = strings.Join(normalTextParts, "")
+			} else {
+				delete(container, "content")
+			}
+		}
+	} else if contentIsArrayOrMap && hasContentField {
+		if len(normalTextParts) > 0 {
+			container["content"] = strings.Join(normalTextParts, "")
+		}
 	}
 }
 
 func (se *StreamExtractor) ProcessSSELine(line []byte) []byte {
-	if se.startTag == "" || se.endTag == "" {
+	if (se.startTag == "" || se.endTag == "") && se.reasoningField == "" {
 		return line
 	}
 
@@ -240,54 +341,62 @@ func (se *StreamExtractor) ProcessSSELine(line []byte) []byte {
 		return line
 	}
 
-	content, _ := delta["content"].(string)
-	se.fullBuffer += content
+	// Process reasoning_field if configured
+	if se.reasoningField != "" {
+		processReasoningField(delta, se.reasoningField)
+	}
 
-	var activeContent string
-	var activeReasoning string
+	// Process tag-based extraction if startTag/endTag configured
+	if se.startTag != "" && se.endTag != "" {
+		content, _ := delta["content"].(string)
+		se.fullBuffer += content
 
-	idxStart := strings.Index(se.fullBuffer, se.startTag)
-	if idxStart == -1 {
-		holdback := getHoldbackPrefix(se.fullBuffer, se.startTag)
-		activeContent = se.fullBuffer[:len(se.fullBuffer)-len(holdback)]
-		activeReasoning = ""
-	} else {
-		contentPart := se.fullBuffer[:idxStart]
-		idxEnd := strings.Index(se.fullBuffer, se.endTag)
-		if idxEnd == -1 {
-			reasoningSoFar := se.fullBuffer[idxStart+len(se.startTag):]
-			holdback := getHoldbackPrefix(reasoningSoFar, se.endTag)
-			activeContent = contentPart
-			activeReasoning = reasoningSoFar[:len(reasoningSoFar)-len(holdback)]
+		var activeContent string
+		var activeReasoning string
+
+		idxStart := strings.Index(se.fullBuffer, se.startTag)
+		if idxStart == -1 {
+			holdback := getHoldbackPrefix(se.fullBuffer, se.startTag)
+			activeContent = se.fullBuffer[:len(se.fullBuffer)-len(holdback)]
+			activeReasoning = ""
 		} else {
-			reasoningPart := se.fullBuffer[idxStart+len(se.startTag) : idxEnd]
-			afterPart := se.fullBuffer[idxEnd+len(se.endTag):]
-			activeContent = contentPart + afterPart
-			activeReasoning = reasoningPart
+			contentPart := se.fullBuffer[:idxStart]
+			idxEnd := strings.Index(se.fullBuffer, se.endTag)
+			if idxEnd == -1 {
+				reasoningSoFar := se.fullBuffer[idxStart+len(se.startTag):]
+				holdback := getHoldbackPrefix(reasoningSoFar, se.endTag)
+				activeContent = contentPart
+				activeReasoning = reasoningSoFar[:len(reasoningSoFar)-len(holdback)]
+			} else {
+				reasoningPart := se.fullBuffer[idxStart+len(se.startTag) : idxEnd]
+				afterPart := se.fullBuffer[idxEnd+len(se.endTag):]
+				activeContent = contentPart + afterPart
+				activeReasoning = reasoningPart
+			}
 		}
-	}
 
-	deltaContent := ""
-	if len(activeContent) > len(se.flushedContent) {
-		deltaContent = activeContent[len(se.flushedContent):]
-	}
-	deltaReasoning := ""
-	if len(activeReasoning) > len(se.flushedReasoning) {
-		deltaReasoning = activeReasoning[len(se.flushedReasoning):]
-	}
+		deltaContent := ""
+		if len(activeContent) > len(se.flushedContent) {
+			deltaContent = activeContent[len(se.flushedContent):]
+		}
+		deltaReasoning := ""
+		if len(activeReasoning) > len(se.flushedReasoning) {
+			deltaReasoning = activeReasoning[len(se.flushedReasoning):]
+		}
 
-	se.flushedContent = activeContent
-	se.flushedReasoning = activeReasoning
+		se.flushedContent = activeContent
+		se.flushedReasoning = activeReasoning
 
-	if deltaContent != "" {
-		delta["content"] = deltaContent
-	} else {
-		delete(delta, "content")
-	}
+		if deltaContent != "" {
+			delta["content"] = deltaContent
+		} else {
+			delete(delta, "content")
+		}
 
-	if deltaReasoning != "" {
-		delta["reasoning"] = deltaReasoning
-		delta["reasoning_content"] = deltaReasoning
+		if deltaReasoning != "" {
+			delta["reasoning"] = deltaReasoning
+			delta["reasoning_content"] = deltaReasoning
+		}
 	}
 
 	modifiedPayload, err := json.Marshal(obj)
@@ -299,8 +408,8 @@ func (se *StreamExtractor) ProcessSSELine(line []byte) []byte {
 }
 
 // ProcessJSONResponse extracts reasoning content from a non-streaming JSON response.
-func ProcessJSONResponse(respBody []byte, startTag, endTag string) []byte {
-	if startTag == "" || endTag == "" {
+func ProcessJSONResponse(respBody []byte, startTag, endTag, reasoningField string) []byte {
+	if (startTag == "" || endTag == "") && reasoningField == "" {
 		return respBody
 	}
 
@@ -324,21 +433,25 @@ func ProcessJSONResponse(respBody []byte, startTag, endTag string) []byte {
 		return respBody
 	}
 
-	content, _ := message["content"].(string)
-	if content == "" {
-		return respBody
+	if reasoningField != "" {
+		processReasoningField(message, reasoningField)
 	}
 
-	idxStart := strings.Index(content, startTag)
-	if idxStart != -1 {
-		idxEnd := strings.Index(content, endTag)
-		if idxEnd != -1 && idxEnd > idxStart {
-			reasoning := content[idxStart+len(startTag) : idxEnd]
-			cleanContent := content[:idxStart] + content[idxEnd+len(endTag):]
+	if startTag != "" && endTag != "" {
+		content, _ := message["content"].(string)
+		if content != "" {
+			idxStart := strings.Index(content, startTag)
+			if idxStart != -1 {
+				idxEnd := strings.Index(content, endTag)
+				if idxEnd != -1 && idxEnd > idxStart {
+					reasoning := content[idxStart+len(startTag) : idxEnd]
+					cleanContent := content[:idxStart] + content[idxEnd+len(endTag):]
 
-			message["content"] = cleanContent
-			message["reasoning"] = reasoning
-			message["reasoning_content"] = reasoning
+					message["content"] = cleanContent
+					message["reasoning"] = reasoning
+					message["reasoning_content"] = reasoning
+				}
+			}
 		}
 	}
 

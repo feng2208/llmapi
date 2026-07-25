@@ -56,6 +56,9 @@ func TestLoadConfig(t *testing.T) {
 	if modelProv.ReasoningStart != "<thought>" || modelProv.ReasoningEnd != "</thought>" {
 		t.Errorf("Expected reasoning tags '<thought>' and '</thought>', got '%s' and '%s'", modelProv.ReasoningStart, modelProv.ReasoningEnd)
 	}
+	if modelProv.ReasoningField != "thinking" {
+		t.Errorf("Expected reasoning_field 'thinking', got %q", modelProv.ReasoningField)
+	}
 }
 
 // 2. Test StateManager (Rate Limiting and 429 Lock)
@@ -369,7 +372,7 @@ func TestProcessJSONResponse(t *testing.T) {
 		}]
 	}`)
 
-	modified := ProcessJSONResponse(rawJSON, "<thought>", "</thought>")
+	modified := ProcessJSONResponse(rawJSON, "<thought>", "</thought>", "")
 	var obj map[string]interface{}
 	if err := json.Unmarshal(modified, &obj); err != nil {
 		t.Fatalf("Invalid JSON returned: %v", err)
@@ -396,7 +399,7 @@ func TestProcessJSONResponse(t *testing.T) {
 
 // 6. Test Streaming reasoning extraction (SSE state machine)
 func TestProcessSSELine(t *testing.T) {
-	extractor := NewStreamExtractor("<thought>", "</thought>")
+	extractor := NewStreamExtractor("<thought>", "</thought>", "")
 
 	// Simulation of consecutive incoming stream lines
 	lines := [][]byte{
@@ -452,6 +455,89 @@ func TestProcessSSELine(t *testing.T) {
 
 	if combinedReasoning != "I think therefore I am." {
 		t.Errorf("Expected combinedReasoning 'I think therefore I am.', got %q", combinedReasoning)
+	}
+}
+
+func TestProcessJSONResponse_ReasoningField(t *testing.T) {
+	rawJSON := []byte(`{
+		"choices": [
+			{
+				"finish_reason": "stop",
+				"index": 0,
+				"message": {
+					"content": [
+						{
+							"closed": true,
+							"thinking": [
+								{
+									"text": "嗯，用户问了为什么大海是蓝色",
+									"type": "text"
+								}
+							],
+							"type": "thinking"
+						},
+						{
+							"text": "hello",
+							"type": "text"
+						}
+					],
+					"role": "assistant"
+				}
+			}
+		]
+	}`)
+
+	modified := ProcessJSONResponse(rawJSON, "", "", "thinking")
+	var obj map[string]interface{}
+	if err := json.Unmarshal(modified, &obj); err != nil {
+		t.Fatalf("Invalid JSON returned: %v", err)
+	}
+
+	choices := obj["choices"].([]interface{})
+	choice := choices[0].(map[string]interface{})
+	message := choice["message"].(map[string]interface{})
+
+	content := message["content"].(string)
+	reasoning := message["reasoning"].(string)
+	reasoningContent := message["reasoning_content"].(string)
+
+	if content != "hello" {
+		t.Errorf("Expected content 'hello', got %q", content)
+	}
+	if reasoning != "嗯，用户问了为什么大海是蓝色" {
+		t.Errorf("Expected reasoning '嗯，用户问了为什么大海是蓝色', got %q", reasoning)
+	}
+	if reasoningContent != "嗯，用户问了为什么大海是蓝色" {
+		t.Errorf("Expected reasoning_content '嗯，用户问了为什么大海是蓝色', got %q", reasoningContent)
+	}
+}
+
+func TestProcessSSELine_ReasoningField(t *testing.T) {
+	extractor := NewStreamExtractor("", "", "thinking")
+
+	sseLine := []byte(`data: {"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"象"}]}]},"finish_reason":null}]}` + "\n")
+
+	out := extractor.ProcessSSELine(sseLine)
+	if !bytes.HasPrefix(out, []byte("data: ")) {
+		t.Fatalf("Expected output to start with data: , got %s", string(out))
+	}
+
+	trimmed := bytes.TrimPrefix(out, []byte("data: "))
+	var obj map[string]interface{}
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		t.Fatalf("Failed to unmarshal output: %v", err)
+	}
+
+	choices := obj["choices"].([]interface{})
+	choice := choices[0].(map[string]interface{})
+	delta := choice["delta"].(map[string]interface{})
+
+	if delta["reasoning"] != "象" || delta["reasoning_content"] != "象" {
+		t.Errorf("Expected reasoning and reasoning_content '象', got reasoning=%v reasoning_content=%v", delta["reasoning"], delta["reasoning_content"])
+	}
+
+	if _, exists := delta["content"]; exists {
+		t.Errorf("Expected content to be deleted when it only contains thinking, got %v", delta["content"])
 	}
 }
 
