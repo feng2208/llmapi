@@ -1,4 +1,4 @@
-package main
+package plugins
 
 import (
 	"bytes"
@@ -14,10 +14,205 @@ import (
 	"time"
 )
 
-// GeminiPart represents a single part of content in Gemini API request
+// GeminiPlugin handles upstreams with api_type: gemini
+type GeminiPlugin struct {
+	BasePlugin
+}
+
+func (g *GeminiPlugin) Name() string {
+	return "gemini"
+}
+
+func (g *GeminiPlugin) BuildTargetURL(endpoint EndpointType, req *http.Request, ctx *Context) string {
+	targetURL := ctx.UpstreamURL
+	u := targetURL
+	if !strings.HasSuffix(u, "/") {
+		u += "/"
+	}
+	u += ctx.ModelName
+	if endpoint == EndpointImageGeneration || endpoint == EndpointImageEdit || endpoint == EndpointAudioSpeech {
+		u += ":generateContent"
+	} else {
+		isStream := ctx.IsStream
+		if req != nil {
+			if req.FormValue("stream") == "true" || req.FormValue("stream") == "1" {
+				isStream = true
+			} else if strings.Contains(req.URL.RawQuery, "stream=true") {
+				isStream = true
+			}
+		}
+		if isStream {
+			u += ":streamGenerateContent"
+			if !strings.Contains(u, "?") {
+				u += "?alt=sse"
+			} else {
+				u += "&alt=sse"
+			}
+		} else {
+			u += ":generateContent"
+		}
+	}
+	return u
+}
+
+func (g *GeminiPlugin) ModifyHeaders(req *http.Request, ctx *Context) {
+	// Standard header deletions & extra maps
+	g.BasePlugin.ModifyHeaders(req, ctx)
+
+	// Custom header handling for Gemini upstream
+	if ctx.AuthKey == "sk-dummy" {
+		req.Header.Del("Authorization")
+		req.Header.Del("x-goog-api-key")
+	} else if ctx.AuthKey != "" {
+		req.Header.Del("Authorization")
+		req.Header.Set("x-goog-api-key", ctx.AuthKey)
+	}
+}
+
+func (g *GeminiPlugin) ModifyResponseHeaders(resp *http.Response, clientHeader http.Header, ctx *Context) {
+	for k, vv := range resp.Header {
+		if k == "Content-Length" || k == "Content-Type" || strings.HasPrefix(k, "X-Goog-") || strings.HasPrefix(k, "x-goog-") {
+			continue
+		}
+		for _, v := range vv {
+			clientHeader.Add(k, v)
+		}
+	}
+}
+
+func (g *GeminiPlugin) TransformRequest(endpoint EndpointType, rawBody []byte, req *http.Request, ctx *Context) ([]byte, string, error) {
+	switch endpoint {
+	case EndpointImageGeneration:
+		modified, err := TransformImageRequestToGemini(rawBody, ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+
+	case EndpointImageEdit:
+		modified, err := TransformImageEditRequestToGemini(req, ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+
+	case EndpointAudioSpeech:
+		modified, err := TransformAudioSpeechRequestToGemini(rawBody, ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+
+	case EndpointAudioTranscription:
+		modified, err := TransformAudioTranscriptionRequestToGemini(req, ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+
+	default: // EndpointChat
+		modified, err := TransformRequestToGemini(rawBody, req, ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+	}
+}
+
+func (g *GeminiPlugin) TransformResponse(endpoint EndpointType, resp *http.Response, body []byte, ctx *Context) ([]byte, string, error) {
+	switch endpoint {
+	case EndpointImageGeneration, EndpointImageEdit:
+		modified, err := ProcessGeminiImageResponse(body, ctx.RawRequestBody)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+
+	case EndpointAudioSpeech:
+		modified, err := ProcessGeminiAudioResponse(body, ctx.RawRequestBody)
+		if err != nil {
+			return nil, "", err
+		}
+		var reqJSON map[string]interface{}
+		_ = json.Unmarshal(ctx.RawRequestBody, &reqJSON)
+		responseFormat, _ := reqJSON["response_format"].(string)
+		contentType := "audio/wav"
+		if strings.ToLower(responseFormat) == "pcm" {
+			contentType = "audio/pcm"
+		}
+		return modified, contentType, nil
+
+	case EndpointAudioTranscription:
+		hasTimestamps := false
+		responseFormat := "json"
+		language := ""
+		if ctx.Request != nil {
+			responseFormat = ctx.Request.FormValue("response_format")
+			language = ctx.Request.FormValue("language")
+			rfLower := strings.ToLower(responseFormat)
+			if rfLower == "verbose_json" || rfLower == "srt" || rfLower == "vtt" {
+				hasTimestamps = true
+			}
+			if ctx.Request.MultipartForm != nil {
+				for _, val := range ctx.Request.MultipartForm.Value["timestamp_granularities[]"] {
+					if val == "segment" {
+						hasTimestamps = true
+					}
+				}
+				for _, val := range ctx.Request.MultipartForm.Value["timestamp_granularities"] {
+					if val == "segment" {
+						hasTimestamps = true
+					}
+				}
+			}
+		}
+		modified, err := ProcessGeminiTranscriptionResponse(body, hasTimestamps, language, responseFormat)
+		if err != nil {
+			return nil, "", err
+		}
+		rfLower := strings.ToLower(responseFormat)
+		contentType := "application/json; charset=utf-8"
+		if rfLower == "text" || rfLower == "srt" || rfLower == "vtt" {
+			contentType = "text/plain; charset=utf-8"
+		}
+		return modified, contentType, nil
+
+	default: // EndpointChat
+		modified, err := ProcessGeminiJSONResponse(body, ctx.ModelName)
+		if err != nil {
+			return nil, "", err
+		}
+		return modified, "application/json; charset=utf-8", nil
+	}
+}
+
+func (g *GeminiPlugin) TransformStreamChunk(endpoint EndpointType, chunk []byte, ctx *Context) ([]byte, error) {
+	if endpoint == EndpointAudioTranscription {
+		delta, _, err := ProcessGeminiSTTStreamLine(chunk)
+		if err != nil {
+			return nil, err
+		}
+		if delta != "" {
+			deltaChunk := map[string]interface{}{
+				"type":     "transcript.text.delta",
+				"delta":    delta,
+				"logprobs": []interface{}{},
+			}
+			b, _ := json.Marshal(deltaChunk)
+			return []byte(fmt.Sprintf("data: %s\n\n", string(b))), nil
+		}
+		return nil, nil
+	}
+	genID := fmt.Sprintf("chatcmpl-%s", GenerateRandomString(12))
+	return ProcessGeminiSSELine(chunk, genID, time.Now().Unix(), ctx.ModelName), nil
+}
+
+// ----------------------------------------------------------------------------
+// Gemini Implementation Details
+// ----------------------------------------------------------------------------
+
 type GeminiPart map[string]interface{}
 
-// GeminiContent represents the content of conversation in Gemini API request
 type GeminiContent struct {
 	Role  string       `json:"role"`
 	Parts []GeminiPart `json:"parts"`
@@ -25,7 +220,6 @@ type GeminiContent struct {
 
 func parseImageUrlPart(urlStr string) (map[string]interface{}, error) {
 	if strings.HasPrefix(urlStr, "data:") {
-		// format: data:<mime>;base64,<data>
 		parts := strings.SplitN(urlStr, ",", 2)
 		if len(parts) != 2 {
 			return nil, errors.New("invalid data URI")
@@ -50,9 +244,7 @@ func parseImageUrlPart(urlStr string) (map[string]interface{}, error) {
 			},
 		}, nil
 	} else if strings.HasPrefix(urlStr, "http://") || strings.HasPrefix(urlStr, "https://") {
-		client := &http.Client{
-			Timeout: 10 * time.Second,
-		}
+		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get(urlStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch image from URL: %w", err)
@@ -65,7 +257,7 @@ func parseImageUrlPart(urlStr string) (map[string]interface{}, error) {
 
 		mimeType := resp.Header.Get("Content-Type")
 		if mimeType == "" {
-			mimeType = "image/jpeg" // Fallback
+			mimeType = "image/jpeg"
 		}
 
 		data, err := io.ReadAll(resp.Body)
@@ -93,12 +285,10 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 
 	cleaned := make(map[string]interface{})
 	for k, v := range m {
-		// Skip schema version/metadata keys that Gemini's protobuf validator rejects
 		if k == "$schema" || k == "$id" || k == "$vocabulary" || k == "$anchor" || k == "additionalProperties" || k == "exclusiveMinimum" {
 			continue
 		}
 
-		// Convert type values to uppercase (e.g. object -> OBJECT, integer -> INTEGER, string -> STRING)
 		if k == "type" {
 			if typeStr, ok := v.(string); ok {
 				cleaned[k] = strings.ToUpper(typeStr)
@@ -106,7 +296,6 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 			}
 		}
 
-		// Recursively clean sub-schemas (e.g. properties, $defs, definitions)
 		if k == "properties" || k == "$defs" || k == "definitions" {
 			if propsMap, ok := v.(map[string]interface{}); ok {
 				cleanedProps := make(map[string]interface{})
@@ -118,7 +307,6 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 			}
 		}
 
-		// Recursively clean items
 		if k == "items" {
 			if itemMap, ok := v.(map[string]interface{}); ok {
 				cleaned[k] = cleanGeminiSchema(itemMap)
@@ -133,7 +321,6 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 			}
 		}
 
-		// Recursively clean allOf, anyOf, oneOf, prefixItems
 		if k == "allOf" || k == "anyOf" || k == "oneOf" || k == "prefixItems" {
 			if schemaArr, ok := v.([]interface{}); ok {
 				cleanedArr := make([]interface{}, 0, len(schemaArr))
@@ -150,75 +337,49 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 	return cleaned
 }
 
-func detectMimeTypeFromContent(data []byte) string {
+func DetectMimeTypeFromContent(data []byte) string {
 	if len(data) < 4 {
 		return "application/octet-stream"
 	}
-
-	// PDF: %PDF
 	if bytes.HasPrefix(data, []byte("%PDF")) {
 		return "application/pdf"
 	}
-
-	// PNG
 	if bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
 		return "image/png"
 	}
-
-	// JPEG
 	if bytes.HasPrefix(data, []byte("\xff\xd8\xff")) {
 		return "image/jpeg"
 	}
-
-	// GIF: GIF8
 	if bytes.HasPrefix(data, []byte("GIF8")) {
 		return "image/gif"
 	}
-
-	// BMP: BM
 	if bytes.HasPrefix(data, []byte("BM")) {
 		return "image/bmp"
 	}
-
-	// FLAC: fLaC
 	if bytes.HasPrefix(data, []byte("fLaC")) {
 		return "audio/flac"
 	}
-
-	// OGG: OggS
 	if bytes.HasPrefix(data, []byte("OggS")) {
 		return "audio/ogg"
 	}
-
-	// WEBM: EBML header \x1A\x45\xDF\xA3
 	if bytes.HasPrefix(data, []byte("\x1a\x45\xdf\xa3")) {
 		return "video/webm"
 	}
-
-	// FLV: FLV\x01
 	if bytes.HasPrefix(data, []byte("FLV\x01")) {
 		return "video/x-flv"
 	}
-
-	// MP3: ID3 or frame sync
 	if bytes.HasPrefix(data, []byte("ID3")) {
 		return "audio/mp3"
 	}
 	if len(data) >= 2 && data[0] == 0xff && (data[1]&0xe0) == 0xe0 {
 		return "audio/mp3"
 	}
-
-	// MPEG: \x00\x00\x01\xBA or \x00\x00\x01\xB3
 	if bytes.HasPrefix(data, []byte("\x00\x00\x01\xba")) || bytes.HasPrefix(data, []byte("\x00\x00\x01\xb3")) {
 		return "video/mpeg"
 	}
-
-	// WMV / ASF: \x30\x26\xB2\x75\x8E\x66\xCF\x11
 	if bytes.HasPrefix(data, []byte("\x30\x26\xb2\x75\x8e\x66\xcf\x11")) {
 		return "video/wmv"
 	}
-
-	// RIFF container checks (WAV, WEBP, AVI)
 	if bytes.HasPrefix(data, []byte("RIFF")) && len(data) >= 12 {
 		container := string(data[8:12])
 		switch container {
@@ -230,16 +391,12 @@ func detectMimeTypeFromContent(data []byte) string {
 			return "video/avi"
 		}
 	}
-
-	// FORM container checks (AIFF)
 	if bytes.HasPrefix(data, []byte("FORM")) && len(data) >= 12 {
 		container := string(data[8:12])
 		if container == "AIFF" || container == "AIFC" {
 			return "audio/aiff"
 		}
 	}
-
-	// MP4 / 3GPP checks via ftyp box
 	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
 		box := string(data[8:12])
 		if strings.HasPrefix(box, "mp4") || strings.HasPrefix(box, "isom") || strings.HasPrefix(box, "avc1") {
@@ -249,13 +406,10 @@ func detectMimeTypeFromContent(data []byte) string {
 			return "video/3gpp"
 		}
 	}
-
-	// Fallback to standard Go content type detection
 	detected := http.DetectContentType(data)
 	if detected != "application/octet-stream" {
 		return detected
 	}
-
 	return "application/octet-stream"
 }
 
@@ -295,18 +449,15 @@ func detectMimeType(filename string) string {
 	}
 }
 
-func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Request, cfg *Config, proxyMgr *ProxyManager) ([]byte, error) {
+func TransformRequestToGemini(rawBody []byte, r *http.Request, ctx *Context) ([]byte, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
 	}
 
 	geminiReq := make(map[string]interface{})
-
-	// 1. Map messages to contents and systemInstruction
 	openAIMessages, _ := body["messages"].([]interface{})
 
-	// Collect toolCallID to function name mapping for tool messages
 	toolCallIDToName := make(map[string]string)
 	for _, msg := range openAIMessages {
 		if msgMap, ok := msg.(map[string]interface{}); ok {
@@ -357,7 +508,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 
 		var parts []GeminiPart
 
-		// Handle content (text, image, audio, file)
 		if role != "tool" {
 			if txt, ok := content.(string); ok && txt != "" {
 				parts = append(parts, map[string]interface{}{"text": txt})
@@ -388,7 +538,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 								if base64Data != "" {
 									dataBytes, err := base64.StdEncoding.DecodeString(base64Data)
 									if err == nil {
-										mimeType := detectMimeTypeFromContent(dataBytes)
+										mimeType := DetectMimeTypeFromContent(dataBytes)
 										if mimeType == "application/octet-stream" {
 											if format != "" {
 												mimeType = "audio/" + format
@@ -404,7 +554,11 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 												},
 											})
 										} else {
-											_, fileURI, err := uploadFileToGemini(r.Context(), route.AuthKey, "audio."+format, bytes.NewReader(dataBytes), int64(len(dataBytes)), mimeType, route, cfg, proxyMgr)
+											reqCtx := context.Background()
+											if r != nil {
+												reqCtx = r.Context()
+											}
+											_, fileURI, err := uploadFileToGemini(reqCtx, ctx.AuthKey, "audio."+format, bytes.NewReader(dataBytes), int64(len(dataBytes)), mimeType, ctx.HTTPClient)
 											if err != nil {
 												return nil, fmt.Errorf("failed to upload audio to Files API: %w", err)
 											}
@@ -446,7 +600,7 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 									if base64Data != "" {
 										dataBytes, err := base64.StdEncoding.DecodeString(base64Data)
 										if err == nil {
-											mimeType := detectMimeTypeFromContent(dataBytes)
+											mimeType := DetectMimeTypeFromContent(dataBytes)
 											if mimeType == "application/octet-stream" {
 												if uriMimeType != "" {
 													mimeType = uriMimeType
@@ -469,7 +623,11 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 													},
 												})
 											} else {
-												_, fileURI, err := uploadFileToGemini(r.Context(), route.AuthKey, displayName, bytes.NewReader(dataBytes), int64(len(dataBytes)), mimeType, route, cfg, proxyMgr)
+												reqCtx := context.Background()
+												if r != nil {
+													reqCtx = r.Context()
+												}
+												_, fileURI, err := uploadFileToGemini(reqCtx, ctx.AuthKey, displayName, bytes.NewReader(dataBytes), int64(len(dataBytes)), mimeType, ctx.HTTPClient)
 												if err != nil {
 													return nil, fmt.Errorf("failed to upload file to Files API: %w", err)
 												}
@@ -492,7 +650,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 			}
 		}
 
-		// Handle tool calls in assistant messages
 		if toolCalls, ok := msgMap["tool_calls"].([]interface{}); ok {
 			for _, tc := range toolCalls {
 				if tcMap, ok := tc.(map[string]interface{}); ok {
@@ -505,7 +662,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 							args = make(map[string]interface{})
 						}
 
-						// Retrieve signature if exists in extra_content
 						var thoughtSig string
 						if extraMap, ok := tcMap["extra_content"].(map[string]interface{}); ok {
 							if googleMap, ok := extraMap["google"].(map[string]interface{}); ok {
@@ -533,7 +689,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 			}
 		}
 
-		// Handle tool response
 		if role == "tool" {
 			name, _ := msgMap["name"].(string)
 			if name == "" {
@@ -597,7 +752,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 		}
 	}
 
-	// 2. Map tools using camelCase "functionDeclarations"
 	if openAITools, ok := body["tools"].([]interface{}); ok && len(openAITools) > 0 {
 		var functionDeclarations []interface{}
 		for _, t := range openAITools {
@@ -628,7 +782,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 		}
 	}
 
-	// 3. Map tool_choice
 	toolConfig := make(map[string]interface{})
 	if toolChoice, ok := body["tool_choice"]; ok {
 		if tcStr, ok := toolChoice.(string); ok {
@@ -660,7 +813,6 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 	toolConfig["includeServerSideToolInvocations"] = true
 	geminiReq["toolConfig"] = toolConfig
 
-	// 4. Map generationConfig
 	generationConfig := make(map[string]interface{})
 
 	if temp, ok := body["temperature"].(float64); ok {
@@ -711,9 +863,8 @@ func TransformRequestToGemini(rawBody []byte, route *SelectedRoute, r *http.Requ
 		geminiReq["generationConfig"] = generationConfig
 	}
 
-	// 5. Merge any custom configuration from route.ModelProvider.RequestBody.Extra
-	for _, configMap := range route.ModelProvider.RequestBody.Extra {
-		deepMerge(geminiReq, configMap)
+	for _, configMap := range ctx.RequestBody.Extra {
+		DeepMerge(geminiReq, configMap)
 	}
 
 	return json.Marshal(geminiReq)
@@ -763,7 +914,7 @@ func ProcessGeminiJSONResponse(rawResp []byte, modelName string) ([]byte, error)
 				}
 
 				thoughtSig, _ := partMap["thoughtSignature"].(string)
-				toolCallID := fmt.Sprintf("call_%d_%s", len(toolCalls), generateRandomString(8))
+				toolCallID := fmt.Sprintf("call_%d_%s", len(toolCalls), GenerateRandomString(8))
 				tcObj := map[string]interface{}{
 					"id":   toolCallID,
 					"type": "function",
@@ -842,7 +993,7 @@ func ProcessGeminiJSONResponse(rawResp []byte, modelName string) ([]byte, error)
 	}
 
 	openAIResp := map[string]interface{}{
-		"id":      fmt.Sprintf("chatcmpl-%s", generateRandomString(12)),
+		"id":      fmt.Sprintf("chatcmpl-%s", GenerateRandomString(12)),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   modelName,
@@ -908,7 +1059,7 @@ func ProcessGeminiSSELine(line []byte, genID string, createdTime int64, modelNam
 				}
 
 				thoughtSig, _ := partMap["thoughtSignature"].(string)
-				toolCallID := fmt.Sprintf("call_%d_%s", len(toolCalls), generateRandomString(8))
+				toolCallID := fmt.Sprintf("call_%d_%s", len(toolCalls), GenerateRandomString(8))
 				tcObj := map[string]interface{}{
 					"index": len(toolCalls),
 					"id":    toolCallID,
@@ -1002,10 +1153,10 @@ func ProcessGeminiSSELine(line []byte, genID string, createdTime int64, modelNam
 		return line
 	}
 
-	return buildSSELine(modifiedPayload, line)
+	return BuildSSELine(modifiedPayload, line)
 }
 
-func TransformImageRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+func TransformImageRequestToGemini(rawBody []byte, ctx *Context) ([]byte, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
@@ -1096,9 +1247,8 @@ func TransformImageRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte
 
 	geminiReq["generationConfig"] = generationConfig
 
-	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
-	for _, configMap := range route.ModelProvider.RequestBody.Extra {
-		deepMerge(geminiReq, configMap)
+	for _, configMap := range ctx.RequestBody.Extra {
+		DeepMerge(geminiReq, configMap)
 	}
 
 	return json.Marshal(geminiReq)
@@ -1111,7 +1261,9 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 	}
 
 	var reqJSON map[string]interface{}
-	_ = json.Unmarshal(rawRequest, &reqJSON) // ignore error, might be empty
+	if len(rawRequest) > 0 {
+		_ = json.Unmarshal(rawRequest, &reqJSON)
+	}
 
 	type OpenAIImageData struct {
 		B64JSON string `json:"b64_json"`
@@ -1122,7 +1274,6 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 		"data":    []OpenAIImageData{},
 	}
 
-	// Copy requested extra fields if present
 	if background, exists := reqJSON["background"]; exists {
 		openAIResp["background"] = background
 	}
@@ -1136,7 +1287,6 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 		openAIResp["quality"] = quality
 	}
 
-	// Include usage block
 	inputTokens := 0
 	outputTokens := 0
 	totalTokens := 0
@@ -1205,11 +1355,10 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 	}
 
 	openAIResp["data"] = dataItems
-
 	return json.Marshal(openAIResp)
 }
 
-func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([]byte, error) {
+func TransformImageEditRequestToGemini(r *http.Request, ctx *Context) ([]byte, error) {
 	if r.MultipartForm == nil {
 		return nil, errors.New("multipart form not parsed")
 	}
@@ -1221,7 +1370,6 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 
 	var parts []interface{}
 
-	// Get image
 	imageKeys := []string{"image", "image[]"}
 	for _, key := range imageKeys {
 		for _, fh := range r.MultipartForm.File[key] {
@@ -1259,7 +1407,6 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 		}
 	}
 
-	// Optionally get mask
 	maskHeaders := r.MultipartForm.File["mask"]
 	if len(maskHeaders) > 0 {
 		fh := maskHeaders[0]
@@ -1377,9 +1524,8 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 
 	geminiReq["generationConfig"] = generationConfig
 
-	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
-	for _, configMap := range route.ModelProvider.RequestBody.Extra {
-		deepMerge(geminiReq, configMap)
+	for _, configMap := range ctx.RequestBody.Extra {
+		DeepMerge(geminiReq, configMap)
 	}
 
 	return json.Marshal(geminiReq)
@@ -1387,50 +1533,37 @@ func TransformImageEditRequestToGemini(r *http.Request, route *SelectedRoute) ([
 
 func CreateWavHeader(dataLen int) []byte {
 	header := make([]byte, 44)
-	// RIFF header
 	copy(header[0:4], "RIFF")
-	// File size - 8
 	fileSize := uint32(dataLen + 36)
 	header[4] = byte(fileSize)
 	header[5] = byte(fileSize >> 8)
 	header[6] = byte(fileSize >> 16)
 	header[7] = byte(fileSize >> 24)
-	// WAVE
 	copy(header[8:12], "WAVE")
-	// fmt chunk
 	copy(header[12:16], "fmt ")
-	// Chunk size (16 for PCM)
 	header[16] = 16
 	header[17] = 0
 	header[18] = 0
 	header[19] = 0
-	// Audio format (1 for PCM)
 	header[20] = 1
 	header[21] = 0
-	// Number of channels (1)
 	header[22] = 1
 	header[23] = 0
-	// Sample rate (24000)
 	sampleRate := uint32(24000)
 	header[24] = byte(sampleRate)
 	header[25] = byte(sampleRate >> 8)
 	header[26] = byte(sampleRate >> 16)
 	header[27] = byte(sampleRate >> 24)
-	// Byte rate (sampleRate * numChannels * bitsPerSample/8) = 24000 * 1 * 2 = 48000
 	byteRate := uint32(48000)
 	header[28] = byte(byteRate)
 	header[29] = byte(byteRate >> 8)
 	header[30] = byte(byteRate >> 16)
 	header[31] = byte(byteRate >> 24)
-	// Block align (numChannels * bitsPerSample/8) = 2
 	header[32] = 2
 	header[33] = 0
-	// Bits per sample (16)
 	header[34] = 16
 	header[35] = 0
-	// data chunk
 	copy(header[36:40], "data")
-	// Chunk size
 	subchunk2Size := uint32(dataLen)
 	header[40] = byte(subchunk2Size)
 	header[41] = byte(subchunk2Size >> 8)
@@ -1439,7 +1572,7 @@ func CreateWavHeader(dataLen int) []byte {
 	return header
 }
 
-func TransformAudioSpeechRequestToGemini(rawBody []byte, route *SelectedRoute) ([]byte, error) {
+func TransformAudioSpeechRequestToGemini(rawBody []byte, ctx *Context) ([]byte, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON request body: %w", err)
@@ -1452,10 +1585,9 @@ func TransformAudioSpeechRequestToGemini(rawBody []byte, route *SelectedRoute) (
 
 	voiceName, _ := body["voice"].(string)
 	if voiceName == "" {
-		voiceName = "Kore" // Default
+		voiceName = "Kore"
 	}
 
-	// Map OpenAI voice names to Gemini prebuilt voice names
 	voiceMapping := map[string]string{
 		"alloy":   "Puck",
 		"echo":    "Charon",
@@ -1520,9 +1652,8 @@ func TransformAudioSpeechRequestToGemini(rawBody []byte, route *SelectedRoute) (
 
 	geminiReq["generationConfig"] = generationConfig
 
-	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
-	for _, configMap := range route.ModelProvider.RequestBody.Extra {
-		deepMerge(geminiReq, configMap)
+	for _, configMap := range ctx.RequestBody.Extra {
+		DeepMerge(geminiReq, configMap)
 	}
 
 	return json.Marshal(geminiReq)
@@ -1577,27 +1708,26 @@ func ProcessGeminiAudioResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 	}
 
 	var reqJSON map[string]interface{}
-	_ = json.Unmarshal(rawRequest, &reqJSON)
+	if len(rawRequest) > 0 {
+		_ = json.Unmarshal(rawRequest, &reqJSON)
+	}
 	responseFormat, _ := reqJSON["response_format"].(string)
 
 	if strings.ToLower(responseFormat) == "pcm" {
 		return pcmData, nil
 	}
 
-	// Wrap PCM in a WAV header
 	wavHeader := CreateWavHeader(len(pcmData))
 	return append(wavHeader, pcmData...), nil
 }
 
-func uploadFileToGemini(ctx context.Context, apiKey string, filename string, fileReader io.Reader, fileSize int64, mimeType string, route *SelectedRoute, cfg *Config, proxyMgr *ProxyManager) (string, string, error) {
-	client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get proxy client: %w", err)
+func uploadFileToGemini(ctx context.Context, apiKey string, filename string, fileReader io.Reader, fileSize int64, mimeType string, httpClient *http.Client) (string, string, error) {
+	client := httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 300 * time.Second}
 	}
 
-	// 1. Initial Metadata Request
 	initURL := fmt.Sprintf("https://generativelanguage.googleapis.com/upload/v1beta/files?key=%s", apiKey)
-
 	initBodyObj := map[string]interface{}{
 		"file": map[string]interface{}{
 			"display_name": filename,
@@ -1635,7 +1765,6 @@ func uploadFileToGemini(ctx context.Context, apiKey string, filename string, fil
 		return "", "", fmt.Errorf("missing X-Goog-Upload-URL header in initiate response")
 	}
 
-	// 2. Upload the Actual Bytes
 	uploadReq, err := http.NewRequestWithContext(ctx, "POST", uploadURL, fileReader)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create upload request: %w", err)
@@ -1672,7 +1801,6 @@ func uploadFileToGemini(ctx context.Context, apiKey string, filename string, fil
 	fileURI := uploadResult.File.URI
 	state := uploadResult.File.State
 
-	// 3. Poll for state if it is PROCESSING
 	if state == "PROCESSING" {
 		pollURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s?key=%s", fileName, apiKey)
 		for {
@@ -1715,35 +1843,7 @@ func uploadFileToGemini(ctx context.Context, apiKey string, filename string, fil
 	return fileName, fileURI, nil
 }
 
-func deleteFileFromGemini(ctx context.Context, apiKey string, fileName string, route *SelectedRoute, cfg *Config, proxyMgr *ProxyManager) {
-	client, err := proxyMgr.GetClient(route.ModelProvider, cfg.Proxy)
-	if err != nil {
-		fmt.Printf("[ERROR] failed to get client for deletion: %v\n", err)
-		return
-	}
-
-	deleteURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s?key=%s", fileName, apiKey)
-	req, err := http.NewRequestWithContext(ctx, "DELETE", deleteURL, nil)
-	if err != nil {
-		fmt.Printf("[ERROR] failed to create delete request: %v\n", err)
-		return
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("[ERROR] delete file %s failed: %v\n", fileName, err)
-		return
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("[WARN] delete file %s returned status %d\n", fileName, resp.StatusCode)
-	} else {
-		fmt.Printf("[INFO] Successfully deleted Gemini file: %s\n", fileName)
-	}
-}
-
-func TransformAudioTranscriptionRequestToGemini(r *http.Request, route *SelectedRoute, cfg *Config, proxyMgr *ProxyManager) ([]byte, error) {
+func TransformAudioTranscriptionRequestToGemini(r *http.Request, ctx *Context) ([]byte, error) {
 	if r.MultipartForm == nil {
 		return nil, errors.New("multipart form not parsed")
 	}
@@ -1794,8 +1894,7 @@ func TransformAudioTranscriptionRequestToGemini(r *http.Request, route *Selected
 			},
 		}
 	} else {
-		// Use Files API!
-		_, fileURI, err := uploadFileToGemini(r.Context(), route.AuthKey, fh.Filename, file, fileSize, mimeType, route, cfg, proxyMgr)
+		_, fileURI, err := uploadFileToGemini(r.Context(), ctx.AuthKey, fh.Filename, file, fileSize, mimeType, ctx.HTTPClient)
 		if err != nil {
 			return nil, fmt.Errorf("failed to upload large file to Gemini Files API: %w", err)
 		}
@@ -1901,9 +2000,8 @@ func TransformAudioTranscriptionRequestToGemini(r *http.Request, route *Selected
 		geminiReq["generationConfig"] = generationConfig
 	}
 
-	// Merge any custom configuration from route.ModelProvider.RequestBody.Extra
-	for _, configMap := range route.ModelProvider.RequestBody.Extra {
-		deepMerge(geminiReq, configMap)
+	for _, configMap := range ctx.RequestBody.Extra {
+		DeepMerge(geminiReq, configMap)
 	}
 
 	return json.Marshal(geminiReq)
@@ -2003,7 +2101,6 @@ func ProcessGeminiTranscriptionResponse(rawResp []byte, hasTimestamps bool, lang
 			return []byte(structuredResp.Text), nil
 		}
 
-		// Otherwise, it's json or verbose_json
 		if responseFormat == "verbose_json" {
 			type OpenAISegment struct {
 				ID               int       `json:"id"`
@@ -2056,19 +2153,16 @@ func ProcessGeminiTranscriptionResponse(rawResp []byte, hasTimestamps bool, lang
 			return json.Marshal(openAIResp)
 		}
 
-		// standard "json" with timestamps parameter specified but format is "json"
 		openAIResp := map[string]interface{}{
 			"text": structuredResp.Text,
 		}
 		return json.Marshal(openAIResp)
 	}
 
-	// Simple plain-text response (hasTimestamps is false)
 	if responseFormat == "text" || responseFormat == "srt" || responseFormat == "vtt" {
 		return []byte(textVal), nil
 	}
 
-	// Return json format
 	openAIResp := map[string]interface{}{
 		"text": textVal,
 	}
@@ -2154,4 +2248,8 @@ func ProcessGeminiSTTStreamLine(line []byte) (string, *GeminiSTTUsage, error) {
 
 	textVal, _ := partMap["text"].(string)
 	return textVal, usage, nil
+}
+
+func init() {
+	Register(&GeminiPlugin{})
 }

@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"llmapi/plugins"
 )
 
 //go:embed config-template.yaml
@@ -122,6 +124,7 @@ type handlerCtx struct {
 }
 
 func executeUpstreamRequest(
+	endpoint plugins.EndpointType,
 	w http.ResponseWriter,
 	r *http.Request,
 	cfg *Config,
@@ -273,32 +276,10 @@ func executeUpstreamRequest(
 		}
 
 		// 7. Build Upstream Request
-		targetURL := route.ModelProvider.Upstream
-		if route.ModelProvider.ApiType == "gemini" {
-			isImageGen := strings.Contains(r.URL.Path, "/images/")
-			isAudioSpeech := strings.Contains(r.URL.Path, "/audio/speech")
-			u := targetURL
-			if !strings.HasSuffix(u, "/") {
-				u += "/"
-			}
-			u += route.ModelProvider.Model
-			if isImageGen || isAudioSpeech {
-				u += ":generateContent"
-			} else {
-				isStream, _ := reqJSON["stream"].(bool)
-				if isStream {
-					u += ":streamGenerateContent"
-					if !strings.Contains(u, "?") {
-						u += "?alt=sse"
-					} else {
-						u += "&alt=sse"
-					}
-				} else {
-					u += ":generateContent"
-				}
-			}
-			targetURL = u
-		}
+		p := plugins.Get(route.ModelProvider.ApiType)
+		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
+		pluginCtx.RawRequestBody = rawBody
+		targetURL := p.BuildTargetURL(endpoint, r, pluginCtx)
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(modifiedBody))
 		if err != nil {
@@ -316,21 +297,10 @@ func executeUpstreamRequest(
 			}
 		}
 		upstreamReq.Header.Set("Content-Type", contentTypeOut)
-
-		// Swap Authorization with chosen upstream auth key
-		if route.AuthKey == "sk-dummy" {
-			upstreamReq.Header.Del("Authorization")
-			upstreamReq.Header.Del("x-goog-api-key")
-		} else if route.ModelProvider.ApiType == "gemini" {
-			upstreamReq.Header.Set("x-goog-api-key", route.AuthKey)
-			upstreamReq.Header.Del("Authorization")
-		} else {
-			upstreamReq.Header.Set("Authorization", "Bearer "+route.AuthKey)
-		}
 		upstreamReq.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
 
-		// Apply custom request header rules from configuration
-		ModifyRequestHeaders(upstreamReq, route)
+		// Apply custom request header rules and auth keys from configuration via plugin
+		p.ModifyHeaders(upstreamReq, pluginCtx)
 
 		if debug {
 			fmt.Printf("[DEBUG] --- OUTGOING REQUEST (attempt %d/%d) ---\n", attempt+1, maxRetries+1)
@@ -395,7 +365,7 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 		bodyModifier := func(rawBody []byte, route *SelectedRoute, req *http.Request) ([]byte, string, error) {
 			return ModifyRequestBody(rawBody, route, req, cfg, proxyMgr)
 		}
-		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, bodyModifier)
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(plugins.EndpointChat, w, r, cfg, stateMgr, router, proxyMgr, bodyModifier)
 		if !ok {
 			return
 		}
@@ -403,33 +373,17 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
-		// 10. Copy headers back to client
-		for k, vv := range resp.Header {
-			// Skip content-length if we are going to modify the body (non-SSE)
-			if !isSSE && k == "Content-Length" {
-				continue
-			}
-			// Skip Content-Type and other Gemini specific headers that we will overwrite
-			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || k == "Content-Length" || strings.HasPrefix(k, "X-Goog-")) {
-				continue
-			}
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
+		p := plugins.Get(route.ModelProvider.ApiType)
+		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
+		pluginCtx.RawRequestBody = hCtx.rawBody
+		pluginCtx.IsStream = isSSE
+		pluginCtx.Request = r
 
-		if route.ModelProvider.ApiType == "gemini" {
-			if isSSE {
-				w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-			} else {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			}
-		}
+		// 10. Copy headers back to client
+		p.ModifyResponseHeaders(resp, w.Header(), pluginCtx)
 
 		// 11. Process and stream response body
 		var respBody io.Reader = resp.Body
-		// Wrap with loggingReader only for SSE (streaming) responses.
-		// For non-SSE JSON, we will print the formatted response body at the end.
 		if debug && isSSE {
 			respBody = &loggingReader{r: resp.Body}
 		}
@@ -440,34 +394,19 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 		}
 
 		if isSSE {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.WriteHeader(resp.StatusCode)
 			reader := bufio.NewReader(respBody)
-			if route.ModelProvider.ApiType == "gemini" {
-				genID := fmt.Sprintf("chatcmpl-%s", generateRandomString(12))
-				createdTime := time.Now().Unix()
-				for {
-					line, err := reader.ReadBytes('\n')
-					if len(line) > 0 {
-						modifiedLine := ProcessGeminiSSELine(line, genID, createdTime, route.ModelProvider.Model)
-						if modifiedLine != nil {
-							_, _ = writer.Write(modifiedLine)
-						}
-					}
-					if err != nil {
-						break
-					}
-				}
-			} else {
-				extractor := NewStreamExtractor(route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd, route.ModelProvider.ReasoningField)
-				for {
-					line, err := reader.ReadBytes('\n')
-					if len(line) > 0 {
-						modifiedLine := extractor.ProcessSSELine(line)
+			for {
+				line, err := reader.ReadBytes('\n')
+				if len(line) > 0 {
+					modifiedLine, _ := p.TransformStreamChunk(plugins.EndpointChat, line, pluginCtx)
+					if modifiedLine != nil {
 						_, _ = writer.Write(modifiedLine)
 					}
-					if err != nil {
-						break
-					}
+				}
+				if err != nil {
+					break
 				}
 			}
 		} else {
@@ -479,15 +418,11 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			if resp.StatusCode == 400 {
 				fmt.Printf("[WARN] Upstream returned HTTP 400. Response body:\n%s\n", string(rawResp))
 			}
-			var modified []byte
-			if route.ModelProvider.ApiType == "gemini" {
-				modified, err = ProcessGeminiJSONResponse(rawResp, route.ModelProvider.Model)
-				if err != nil {
-					w.WriteHeader(http.StatusBadGateway)
-					return
-				}
-			} else {
-				modified = ProcessJSONResponse(rawResp, route.ModelProvider.ReasoningStart, route.ModelProvider.ReasoningEnd, route.ModelProvider.ReasoningField)
+
+			modified, contentType, err := p.TransformResponse(plugins.EndpointChat, resp, rawResp, pluginCtx)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
 			}
 
 			if debug {
@@ -499,6 +434,7 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 				fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
 			}
 
+			w.Header().Set("Content-Type", contentType)
 			w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
 			w.WriteHeader(resp.StatusCode)
 			_, _ = writer.Write(modified)
@@ -513,28 +449,19 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 
 func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyImageRequestBody)
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(plugins.EndpointImageGeneration, w, r, cfg, stateMgr, router, proxyMgr, ModifyImageRequestBody)
 		if !ok {
 			return
 		}
 		defer resp.Body.Close()
 
-		// 10. Copy headers back to client
-		for k, vv := range resp.Header {
-			if k == "Content-Length" {
-				continue
-			}
-			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
-				continue
-			}
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
+		p := plugins.Get(route.ModelProvider.ApiType)
+		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
+		pluginCtx.RawRequestBody = hCtx.rawBody
+		pluginCtx.Request = r
 
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		p.ModifyResponseHeaders(resp, w.Header(), pluginCtx)
 
-		// 11. Process and write response body
 		rawResp, err := io.ReadAll(resp.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
@@ -553,22 +480,17 @@ func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router,
 			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
 		}
 
-		var modified []byte
-		if route.ModelProvider.ApiType == "gemini" {
-			modified, err = ProcessGeminiImageResponse(rawResp, hCtx.rawBody)
-			if err != nil {
-				w.WriteHeader(http.StatusBadGateway)
-				return
-			}
-		} else {
-			modified = rawResp
+		modified, contentType, err := p.TransformResponse(plugins.EndpointImageGeneration, resp, rawResp, pluginCtx)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
 		}
 
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(modified)
 
-		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Image)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
@@ -577,28 +499,19 @@ func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router,
 
 func handleImageEdits(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyImageEditRequestBody)
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(plugins.EndpointImageEdit, w, r, cfg, stateMgr, router, proxyMgr, ModifyImageEditRequestBody)
 		if !ok {
 			return
 		}
 		defer resp.Body.Close()
 
-		// 10. Copy headers back to client
-		for k, vv := range resp.Header {
-			if k == "Content-Length" {
-				continue
-			}
-			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
-				continue
-			}
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
+		p := plugins.Get(route.ModelProvider.ApiType)
+		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
+		pluginCtx.RawRequestBody = hCtx.rawBody
+		pluginCtx.Request = r
 
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		p.ModifyResponseHeaders(resp, w.Header(), pluginCtx)
 
-		// 11. Process and write response body
 		rawResp, err := io.ReadAll(resp.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
@@ -617,22 +530,17 @@ func handleImageEdits(cfg *Config, stateMgr *StateManager, router *Router, proxy
 			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
 		}
 
-		var modified []byte
-		if route.ModelProvider.ApiType == "gemini" {
-			modified, err = ProcessGeminiImageResponse(rawResp, hCtx.rawBody)
-			if err != nil {
-				w.WriteHeader(http.StatusBadGateway)
-				return
-			}
-		} else {
-			modified = rawResp
+		modified, contentType, err := p.TransformResponse(plugins.EndpointImageEdit, resp, rawResp, pluginCtx)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
 		}
 
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(modified)
 
-		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Image Edit)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
@@ -641,41 +549,19 @@ func handleImageEdits(cfg *Config, stateMgr *StateManager, router *Router, proxy
 
 func handleAudioSpeech(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, ModifyAudioSpeechRequestBody)
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(plugins.EndpointAudioSpeech, w, r, cfg, stateMgr, router, proxyMgr, ModifyAudioSpeechRequestBody)
 		if !ok {
 			return
 		}
 		defer resp.Body.Close()
 
-		// 10. Copy headers back to client
-		for k, vv := range resp.Header {
-			if k == "Content-Length" {
-				continue
-			}
-			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
-				continue
-			}
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
+		p := plugins.Get(route.ModelProvider.ApiType)
+		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
+		pluginCtx.RawRequestBody = hCtx.rawBody
+		pluginCtx.Request = r
 
-		// Set content type for client
-		if route.ModelProvider.ApiType == "gemini" {
-			var reqJSON map[string]interface{}
-			_ = json.Unmarshal(hCtx.rawBody, &reqJSON)
-			responseFormat, _ := reqJSON["response_format"].(string)
-			switch strings.ToLower(responseFormat) {
-			case "pcm":
-				w.Header().Set("Content-Type", "audio/pcm")
-			case "wav":
-				w.Header().Set("Content-Type", "audio/wav")
-			default:
-				w.Header().Set("Content-Type", "audio/wav") // Default returned format is WAV for client
-			}
-		}
+		p.ModifyResponseHeaders(resp, w.Header(), pluginCtx)
 
-		// 11. Process and write response body
 		rawResp, err := io.ReadAll(resp.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
@@ -696,28 +582,23 @@ func handleAudioSpeech(cfg *Config, stateMgr *StateManager, router *Router, prox
 			fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
 		}
 
-		var modified []byte
-		if route.ModelProvider.ApiType == "gemini" {
-			modified, err = ProcessGeminiAudioResponse(rawResp, hCtx.rawBody)
-			if err != nil {
-				w.WriteHeader(http.StatusBadGateway)
-				if json.Valid(rawResp) {
-					w.Header().Set("Content-Type", "application/json; charset=utf-8")
-					w.Header().Set("Content-Length", strconv.Itoa(len(rawResp)))
-					w.WriteHeader(resp.StatusCode)
-					_, _ = w.Write(rawResp)
-				}
-				return
+		modified, contentType, err := p.TransformResponse(plugins.EndpointAudioSpeech, resp, rawResp, pluginCtx)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			if json.Valid(rawResp) {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("Content-Length", strconv.Itoa(len(rawResp)))
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(rawResp)
 			}
-		} else {
-			modified = rawResp
+			return
 		}
 
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(modified)
 
-		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Speech)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)
@@ -730,7 +611,7 @@ func handleAudioTranscriptions(cfg *Config, stateMgr *StateManager, router *Rout
 			return ModifyAudioTranscriptionRequestBody(rawBody, route, req, cfg, proxyMgr)
 		}
 
-		route, resp, hCtx, startTime, ok := executeUpstreamRequest(w, r, cfg, stateMgr, router, proxyMgr, bodyModifier)
+		route, resp, hCtx, startTime, ok := executeUpstreamRequest(plugins.EndpointAudioTranscription, w, r, cfg, stateMgr, router, proxyMgr, bodyModifier)
 		if !ok {
 			return
 		}
@@ -738,116 +619,45 @@ func handleAudioTranscriptions(cfg *Config, stateMgr *StateManager, router *Rout
 
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
+		p := plugins.Get(route.ModelProvider.ApiType)
+		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
+		pluginCtx.RawRequestBody = hCtx.rawBody
+		pluginCtx.IsStream = isSSE
+		pluginCtx.Request = r
+
 		var respBody io.Reader = resp.Body
 		if debug && isSSE {
 			respBody = &loggingReader{r: resp.Body}
 		}
 
-		// 10. Copy headers back to client
-		for k, vv := range resp.Header {
-			if k == "Content-Length" {
-				continue
-			}
-			if route.ModelProvider.ApiType == "gemini" && (k == "Content-Type" || strings.HasPrefix(k, "X-Goog-")) {
-				continue
-			}
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
+		p.ModifyResponseHeaders(resp, w.Header(), pluginCtx)
 
 		var writer io.Writer = w
 		if flusher, ok := w.(http.Flusher); ok {
 			writer = flushingWriter{w: w, f: flusher}
 		}
 
-		responseFormat := r.FormValue("response_format")
 		if isSSE {
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.WriteHeader(resp.StatusCode)
 
 			reader := bufio.NewReader(respBody)
+			for {
+				line, err := reader.ReadBytes('\n')
+				if len(line) > 0 {
+					modifiedLine, _ := p.TransformStreamChunk(plugins.EndpointAudioTranscription, line, pluginCtx)
+					if modifiedLine != nil {
+						_, _ = writer.Write(modifiedLine)
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
 			if route.ModelProvider.ApiType == "gemini" {
-				var fullText strings.Builder
-				var finalUsage *GeminiSTTUsage
-				for {
-					line, err := reader.ReadBytes('\n')
-					if len(line) > 0 {
-						delta, usage, processErr := ProcessGeminiSTTStreamLine(line)
-						if processErr == io.EOF {
-							break
-						}
-						if usage != nil {
-							finalUsage = usage
-						}
-						if processErr == nil && delta != "" {
-							fullText.WriteString(delta)
-							deltaChunk := map[string]interface{}{
-								"type": "transcript.text.delta",
-								"delta": delta,
-								"logprobs": []interface{}{},
-							}
-							b, _ := json.Marshal(deltaChunk)
-							_, _ = writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(b))))
-						}
-					}
-					if err != nil {
-						break
-					}
-				}
-
-				inputTokens := 0
-				outputTokens := 0
-				totalTokens := 0
-				audioTokens := 0
-				textTokens := 0
-				if finalUsage != nil {
-					inputTokens = finalUsage.PromptTokens
-					outputTokens = finalUsage.CandidatesTokens
-					totalTokens = finalUsage.TotalTokens
-					audioTokens = finalUsage.AudioTokens
-					textTokens = finalUsage.TextTokens
-				}
-
-				// Send the final "done" message
-				doneChunk := map[string]interface{}{
-					"type": "transcript.text.done",
-					"text": fullText.String(),
-					"logprobs": []interface{}{},
-					"usage": map[string]interface{}{
-						"input_tokens": inputTokens,
-						"input_token_details": map[string]interface{}{
-							"text_tokens": textTokens,
-							"audio_tokens": audioTokens,
-						},
-						"output_tokens": outputTokens,
-						"total_tokens": totalTokens,
-					},
-				}
-				b, _ := json.Marshal(doneChunk)
-				_, _ = writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(b))))
 				_, _ = writer.Write([]byte("data: [DONE]\n\n"))
-			} else {
-				// Standard proxy streaming for non-Gemini upstreams
-				for {
-					line, err := reader.ReadBytes('\n')
-					if len(line) > 0 {
-						_, _ = writer.Write(line)
-					}
-					if err != nil {
-						break
-					}
-				}
 			}
 		} else {
-			// Set the correct Content-Type for non-streaming formats
-			rfLower := strings.ToLower(responseFormat)
-			if rfLower == "text" || rfLower == "srt" || rfLower == "vtt" {
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			} else {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			}
-
 			rawResp, err := io.ReadAll(resp.Body)
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
@@ -866,41 +676,18 @@ func handleAudioTranscriptions(cfg *Config, stateMgr *StateManager, router *Rout
 				fmt.Printf("[DEBUG] --- UPSTREAM RESPONSE BODY (RAW) ---\n%s\n", bodyStr)
 			}
 
-			var modified []byte
-			if route.ModelProvider.ApiType == "gemini" {
-				var hasTimestamps bool
-				if rfLower == "verbose_json" || rfLower == "srt" || rfLower == "vtt" {
-					hasTimestamps = true
-				}
-				if r.MultipartForm != nil {
-					for _, val := range r.MultipartForm.Value["timestamp_granularities[]"] {
-						if val == "segment" {
-							hasTimestamps = true
-						}
-					}
-					for _, val := range r.MultipartForm.Value["timestamp_granularities"] {
-						if val == "segment" {
-							hasTimestamps = true
-						}
-					}
-				}
-
-				language := r.FormValue("language")
-				modified, err = ProcessGeminiTranscriptionResponse(rawResp, hasTimestamps, language, responseFormat)
-				if err != nil {
-					w.WriteHeader(http.StatusBadGateway)
-					return
-				}
-			} else {
-				modified = rawResp
+			modified, contentType, err := p.TransformResponse(plugins.EndpointAudioTranscription, resp, rawResp, pluginCtx)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
 			}
 
+			w.Header().Set("Content-Type", contentType)
 			w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(modified)
 		}
 
-		// Access logging
 		elapsed := time.Since(startTime)
 		fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s (Transcription)\n",
 			time.Now().Format("2006-01-02 15:04:05.000"), hCtx.modelName, route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, elapsed)

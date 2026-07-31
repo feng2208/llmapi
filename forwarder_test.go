@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"llmapi/plugins"
 )
 
 // 1. Test Config Loading
@@ -642,7 +644,7 @@ func TestGeminiTranslation(t *testing.T) {
 		t.Fatalf("Failed to marshal OpenAI request: %v", err)
 	}
 
-	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
+	translatedBytes, err := plugins.TransformRequestToGemini(reqBytes, nil, buildPluginContext(route, nil, nil, nil))
 	if err != nil {
 		t.Fatalf("TransformRequestToGemini failed: %v", err)
 	}
@@ -818,7 +820,7 @@ func TestGeminiTranslation(t *testing.T) {
 		}
 	}`
 
-	translatedResp, err := ProcessGeminiJSONResponse([]byte(geminiRespJSON), "gemini-2.5-flash")
+	translatedResp, err := plugins.ProcessGeminiJSONResponse([]byte(geminiRespJSON), "gemini-2.5-flash")
 	if err != nil {
 		t.Fatalf("ProcessGeminiJSONResponse failed: %v", err)
 	}
@@ -878,7 +880,7 @@ func TestGeminiTranslation(t *testing.T) {
 
 	var outputLines []string
 	for _, l := range sseLines {
-		out := ProcessGeminiSSELine(l, "chatcmpl-test", 12345678, "gemini-2.5-flash")
+		out := plugins.ProcessGeminiSSELine(l, "chatcmpl-test", 12345678, "gemini-2.5-flash")
 		if out != nil {
 			outputLines = append(outputLines, string(out))
 		}
@@ -928,7 +930,11 @@ func TestGeminiTranslation(t *testing.T) {
 }
 
 // 8. Test deepMerge recursive merging and map normalization
-func TestDeepMergeTypes(t *testing.T) {
+func deepMerge(dst, src map[string]interface{}) {
+	plugins.DeepMerge(dst, src)
+}
+
+func TestDeepMergeMaps(t *testing.T) {
 	dst := map[string]interface{}{
 		"generationConfig": map[string]interface{}{
 			"maxOutputTokens": 32000,
@@ -1031,6 +1037,55 @@ func TestDeepMergeSlices(t *testing.T) {
 	}
 }
 
+func TestOpenAIPluginTransformStreamChunkReasoningField(t *testing.T) {
+	plugin := plugins.Get("openai")
+	if plugin == nil {
+		t.Fatalf("OpenAI plugin not registered")
+	}
+
+	ctx := &plugins.Context{
+		ReasoningField: "thinking",
+		IsStream:       true,
+	}
+
+	sseLine := []byte("data: {\"choices\":[{\"delta\":{\"thinking\":\"Deep thinking content\",\"content\":null}}]}\n\n")
+
+	transformed, err := plugin.TransformStreamChunk(plugins.EndpointChat, sseLine, ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	trimmed := bytes.TrimSpace(transformed)
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		t.Fatalf("Expected SSE data prefix, got: %s", string(transformed))
+	}
+
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	var res map[string]interface{}
+	if err := json.Unmarshal(payload, &res); err != nil {
+		t.Fatalf("Failed to parse transformed JSON payload: %v", err)
+	}
+
+	choices, ok := res["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		t.Fatalf("Missing choices in transformed payload")
+	}
+	delta, ok := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Missing delta in choice")
+	}
+
+	if delta["reasoning"] != "Deep thinking content" {
+		t.Errorf("Expected reasoning field 'Deep thinking content', got '%v'", delta["reasoning"])
+	}
+	if delta["reasoning_content"] != "Deep thinking content" {
+		t.Errorf("Expected reasoning_content field 'Deep thinking content', got '%v'", delta["reasoning_content"])
+	}
+	if _, exists := delta["thinking"]; exists {
+		t.Errorf("Original reasoning field 'thinking' should have been removed, but exists")
+	}
+}
+
 func TestTransformImageRequestToGemini(t *testing.T) {
 	route := &SelectedRoute{
 		ModelProvider: &ModelProviderConfig{
@@ -1055,7 +1110,7 @@ func TestTransformImageRequestToGemini(t *testing.T) {
 		"size": "1024x768"
 	}`)
 
-	modified, err := TransformImageRequestToGemini(reqBody, route)
+	modified, err := plugins.TransformImageRequestToGemini(reqBody, buildPluginContext(route, nil, nil, nil))
 	if err != nil {
 		t.Fatalf("Failed to transform: %v", err)
 	}
@@ -1126,7 +1181,7 @@ func TestProcessGeminiImageResponse(t *testing.T) {
 	}`)
 
 	// 1. Test DEFAULT response format (omitted), which should return 'b64_json'
-	respDefault, err := ProcessGeminiImageResponse(geminiResp, clientReq)
+	respDefault, err := plugins.ProcessGeminiImageResponse(geminiResp, clientReq)
 	if err != nil {
 		t.Fatalf("Failed to process default: %v", err)
 	}
@@ -1174,7 +1229,7 @@ func TestProcessGeminiImageResponse(t *testing.T) {
 	clientReqURL := []byte(`{
 		"response_format": "url"
 	}`)
-	respURL, err := ProcessGeminiImageResponse(geminiResp, clientReqURL)
+	respURL, err := plugins.ProcessGeminiImageResponse(geminiResp, clientReqURL)
 	if err != nil {
 		t.Fatalf("Failed to process: %v", err)
 	}
@@ -1279,7 +1334,7 @@ func TestGeminiTranslationBypass(t *testing.T) {
 		t.Fatalf("Failed to marshal OpenAI request: %v", err)
 	}
 
-	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
+	translatedBytes, err := plugins.TransformRequestToGemini(reqBytes, nil, buildPluginContext(route, nil, nil, nil))
 	if err != nil {
 		t.Fatalf("TransformRequestToGemini failed: %v", err)
 	}
@@ -1642,7 +1697,7 @@ func TestAudioSpeechTranslation(t *testing.T) {
 		},
 	}
 
-	translated, err := TransformAudioSpeechRequestToGemini(openAIReq, route)
+	translated, err := plugins.TransformAudioSpeechRequestToGemini(openAIReq, buildPluginContext(route, nil, nil, nil))
 	if err != nil {
 		t.Fatalf("TransformAudioSpeechRequestToGemini failed: %v", err)
 	}
@@ -1702,7 +1757,7 @@ func TestAudioSpeechTranslation(t *testing.T) {
 	}`)
 
 	// SGVsbG8= is base64 for "Hello"
-	outWav, err := ProcessGeminiAudioResponse(geminiResp, openAIReq)
+	outWav, err := plugins.ProcessGeminiAudioResponse(geminiResp, openAIReq)
 	if err != nil {
 		t.Fatalf("ProcessGeminiAudioResponse failed: %v", err)
 	}
@@ -1725,7 +1780,7 @@ func TestAudioSpeechTranslation(t *testing.T) {
 		"voice": "alloy",
 		"response_format": "pcm"
 	}`)
-	outPCM, err := ProcessGeminiAudioResponse(geminiResp, pcmReq)
+	outPCM, err := plugins.ProcessGeminiAudioResponse(geminiResp, pcmReq)
 	if err != nil {
 		t.Fatalf("ProcessGeminiAudioResponse failed with pcm format: %v", err)
 	}
@@ -1794,7 +1849,9 @@ func TestModifyAudioTranscriptionMultipartBody(t *testing.T) {
 		},
 	}
 
-	body, contentType, err := ModifyAudioTranscriptionMultipartBody(req, route)
+	p := plugins.Get("openai")
+	ctx := buildPluginContext(route, req, nil, nil)
+	body, contentType, err := p.TransformRequest(plugins.EndpointAudioTranscription, nil, req, ctx)
 	if err != nil {
 		t.Fatalf("ModifyAudioTranscriptionMultipartBody failed: %v", err)
 	}
@@ -1855,7 +1912,7 @@ func TestTransformAudioTranscriptionRequestToGeminiInline(t *testing.T) {
 	}
 	proxyMgr := NewProxyManager()
 
-	modified, err := TransformAudioTranscriptionRequestToGemini(req, route, cfg, proxyMgr)
+	modified, err := plugins.TransformAudioTranscriptionRequestToGemini(req, buildPluginContext(route, req, cfg, proxyMgr))
 	if err != nil {
 		t.Fatalf("TransformAudioTranscriptionRequestToGemini failed: %v", err)
 	}
@@ -1932,7 +1989,7 @@ func TestProcessGeminiTranscriptionResponse_Simple(t *testing.T) {
 	}`)
 
 	// Test mapping to JSON
-	outJSON, err := ProcessGeminiTranscriptionResponse(geminiResp, false, "", "json")
+	outJSON, err := plugins.ProcessGeminiTranscriptionResponse(geminiResp, false, "", "json")
 	if err != nil {
 		t.Fatalf("ProcessGeminiTranscriptionResponse failed: %v", err)
 	}
@@ -1947,7 +2004,7 @@ func TestProcessGeminiTranscriptionResponse_Simple(t *testing.T) {
 	}
 
 	// Test mapping to raw text
-	outText, err := ProcessGeminiTranscriptionResponse(geminiResp, false, "", "text")
+	outText, err := plugins.ProcessGeminiTranscriptionResponse(geminiResp, false, "", "text")
 	if err != nil {
 		t.Fatalf("ProcessGeminiTranscriptionResponse failed: %v", err)
 	}
@@ -1981,7 +2038,7 @@ func TestProcessGeminiTranscriptionResponse_VerboseTimestamps(t *testing.T) {
 	}`, geminiStructuredJSON))
 
 	// 1. Test mapping to verbose_json
-	outVerbose, err := ProcessGeminiTranscriptionResponse(geminiResp, true, "french", "verbose_json")
+	outVerbose, err := plugins.ProcessGeminiTranscriptionResponse(geminiResp, true, "french", "verbose_json")
 	if err != nil {
 		t.Fatalf("ProcessGeminiTranscriptionResponse verbose_json failed: %v", err)
 	}
@@ -2019,7 +2076,7 @@ func TestProcessGeminiTranscriptionResponse_VerboseTimestamps(t *testing.T) {
 	}
 
 	// 2. Test mapping to srt format
-	outSRT, err := ProcessGeminiTranscriptionResponse(geminiResp, true, "", "srt")
+	outSRT, err := plugins.ProcessGeminiTranscriptionResponse(geminiResp, true, "", "srt")
 	if err != nil {
 		t.Fatalf("ProcessGeminiTranscriptionResponse srt failed: %v", err)
 	}
@@ -2032,7 +2089,7 @@ func TestProcessGeminiTranscriptionResponse_VerboseTimestamps(t *testing.T) {
 	}
 
 	// 3. Test mapping to vtt format
-	outVTT, err := ProcessGeminiTranscriptionResponse(geminiResp, true, "", "vtt")
+	outVTT, err := plugins.ProcessGeminiTranscriptionResponse(geminiResp, true, "", "vtt")
 	if err != nil {
 		t.Fatalf("ProcessGeminiTranscriptionResponse vtt failed: %v", err)
 	}
@@ -2046,7 +2103,7 @@ func TestProcessGeminiTranscriptionResponse_VerboseTimestamps(t *testing.T) {
 
 func TestProcessGeminiSTTStreamLine(t *testing.T) {
 	line := []byte(`data: {"candidates":[{"content":{"parts":[{"text":"Skies of blue"}]}}], "usageMetadata": {"promptTokenCount": 140, "candidatesTokenCount": 10, "totalTokenCount": 150, "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 100}, {"modality": "TEXT", "tokenCount": 40}]}}`)
-	delta, usage, err := ProcessGeminiSTTStreamLine(line)
+	delta, usage, err := plugins.ProcessGeminiSTTStreamLine(line)
 	if err != nil {
 		t.Fatalf("ProcessGeminiSTTStreamLine failed: %v", err)
 	}
@@ -2069,7 +2126,7 @@ func TestProcessGeminiSTTStreamLine(t *testing.T) {
 
 	// Test EOF line
 	doneLine := []byte(`data: [DONE]`)
-	_, _, err = ProcessGeminiSTTStreamLine(doneLine)
+	_, _, err = plugins.ProcessGeminiSTTStreamLine(doneLine)
 	if err != io.EOF {
 		t.Errorf("Expected io.EOF on [DONE], got %v", err)
 	}
@@ -2111,7 +2168,7 @@ func TestTransformRequestToGemini_InputAudio(t *testing.T) {
 		t.Fatalf("Failed to marshal OpenAI request: %v", err)
 	}
 
-	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
+	translatedBytes, err := plugins.TransformRequestToGemini(reqBytes, nil, buildPluginContext(route, nil, nil, nil))
 	if err != nil {
 		t.Fatalf("TransformRequestToGemini failed: %v", err)
 	}
@@ -2177,7 +2234,7 @@ func TestTransformRequestToGemini_File(t *testing.T) {
 		t.Fatalf("Failed to marshal OpenAI request: %v", err)
 	}
 
-	translatedBytes, err := TransformRequestToGemini(reqBytes, route, nil, nil, nil)
+	translatedBytes, err := plugins.TransformRequestToGemini(reqBytes, nil, buildPluginContext(route, nil, nil, nil))
 	if err != nil {
 		t.Fatalf("TransformRequestToGemini failed: %v", err)
 	}
@@ -2229,7 +2286,7 @@ func TestDetectMimeTypeFromContent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := detectMimeTypeFromContent(tc.data)
+			got := plugins.DetectMimeTypeFromContent(tc.data)
 			if got != tc.expected {
 				t.Errorf("Expected %q, got %q", tc.expected, got)
 			}
@@ -2319,7 +2376,7 @@ func TestDeleteNestedPath(t *testing.T) {
 	}
 
 	// 1. Delete a nested key inside a slice with bracket syntax: messages[].reasoning_content
-	deleteNestedPath(body, "messages[].reasoning_content")
+	plugins.DeleteNestedPath(body, "messages[].reasoning_content")
 
 	messages, ok := body["messages"].([]interface{})
 	if !ok {
@@ -2334,7 +2391,7 @@ func TestDeleteNestedPath(t *testing.T) {
 	}
 
 	// 2. Delete a nested key inside a slice with auto-fallback dot syntax: messages.content
-	deleteNestedPath(body, "messages.content")
+	plugins.DeleteNestedPath(body, "messages.content")
 
 	for _, m := range messages {
 		msgMap := m.(map[string]interface{})
@@ -2348,7 +2405,7 @@ func TestDeleteNestedPath(t *testing.T) {
 	}
 
 	// 3. Delete deep nested key: settings.options.max_tokens
-	deleteNestedPath(body, "settings.options.max_tokens")
+	plugins.DeleteNestedPath(body, "settings.options.max_tokens")
 
 	settings := body["settings"].(map[string]interface{})
 	options := settings["options"].(map[string]interface{})
