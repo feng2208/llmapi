@@ -584,12 +584,13 @@ func handleAudioSpeech(cfg *Config, stateMgr *StateManager, router *Router, prox
 
 		modified, contentType, err := p.TransformResponse(plugins.EndpointAudioSpeech, resp, rawResp, pluginCtx)
 		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
 			if json.Valid(rawResp) {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("Content-Length", strconv.Itoa(len(rawResp)))
 				w.WriteHeader(resp.StatusCode)
 				_, _ = w.Write(rawResp)
+			} else {
+				w.WriteHeader(http.StatusBadGateway)
 			}
 			return
 		}
