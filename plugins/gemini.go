@@ -863,9 +863,7 @@ func TransformRequestToGemini(rawBody []byte, r *http.Request, ctx *Context) ([]
 		geminiReq["generationConfig"] = generationConfig
 	}
 
-	for _, configMap := range ctx.RequestBody.Extra {
-		DeepMerge(geminiReq, configMap)
-	}
+	applyDeleteAndExtra(geminiReq, ctx.RequestBody)
 
 	return json.Marshal(geminiReq)
 }
@@ -1247,9 +1245,7 @@ func TransformImageRequestToGemini(rawBody []byte, ctx *Context) ([]byte, error)
 
 	geminiReq["generationConfig"] = generationConfig
 
-	for _, configMap := range ctx.RequestBody.Extra {
-		DeepMerge(geminiReq, configMap)
-	}
+	applyDeleteAndExtra(geminiReq, ctx.RequestBody)
 
 	return json.Marshal(geminiReq)
 }
@@ -1524,9 +1520,7 @@ func TransformImageEditRequestToGemini(r *http.Request, ctx *Context) ([]byte, e
 
 	geminiReq["generationConfig"] = generationConfig
 
-	for _, configMap := range ctx.RequestBody.Extra {
-		DeepMerge(geminiReq, configMap)
-	}
+	applyDeleteAndExtra(geminiReq, ctx.RequestBody)
 
 	return json.Marshal(geminiReq)
 }
@@ -1652,9 +1646,7 @@ func TransformAudioSpeechRequestToGemini(rawBody []byte, ctx *Context) ([]byte, 
 
 	geminiReq["generationConfig"] = generationConfig
 
-	for _, configMap := range ctx.RequestBody.Extra {
-		DeepMerge(geminiReq, configMap)
-	}
+	applyDeleteAndExtra(geminiReq, ctx.RequestBody)
 
 	return json.Marshal(geminiReq)
 }
@@ -2000,9 +1992,7 @@ func TransformAudioTranscriptionRequestToGemini(r *http.Request, ctx *Context) (
 		geminiReq["generationConfig"] = generationConfig
 	}
 
-	for _, configMap := range ctx.RequestBody.Extra {
-		DeepMerge(geminiReq, configMap)
-	}
+	applyDeleteAndExtra(geminiReq, ctx.RequestBody)
 
 	return json.Marshal(geminiReq)
 }
