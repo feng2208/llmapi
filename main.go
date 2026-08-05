@@ -279,6 +279,7 @@ func executeUpstreamRequest(
 		p := plugins.Get(route.ModelProvider.ApiType)
 		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
 		pluginCtx.RawRequestBody = rawBody
+		pluginCtx.IsStream = plugins.IsStreamRequested(r, rawBody, hCtx.reqJSON)
 		targetURL := p.BuildTargetURL(endpoint, r, pluginCtx)
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(modifiedBody))

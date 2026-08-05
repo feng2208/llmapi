@@ -5,8 +5,66 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
+	"strings"
 	"time"
 )
+
+// IsStreamRequested checks if a request specifies streaming via JSON body, form values, or query parameters.
+func IsStreamRequested(r *http.Request, rawBody []byte, reqJSON map[string]interface{}) bool {
+	if reqJSON != nil {
+		if v, ok := reqJSON["stream"]; ok {
+			switch val := v.(type) {
+			case bool:
+				if val {
+					return true
+				}
+			case string:
+				if val == "true" || val == "1" {
+					return true
+				}
+			case float64:
+				if val != 0 {
+					return true
+				}
+			}
+		}
+	} else if len(rawBody) > 0 {
+		var body map[string]interface{}
+		if err := json.Unmarshal(rawBody, &body); err == nil {
+			if v, ok := body["stream"]; ok {
+				switch val := v.(type) {
+				case bool:
+					if val {
+						return true
+					}
+				case string:
+					if val == "true" || val == "1" {
+						return true
+					}
+				case float64:
+					if val != 0 {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	if r != nil {
+		if r.FormValue("stream") == "true" || r.FormValue("stream") == "1" {
+			return true
+		}
+		if query := r.URL.Query(); query.Get("stream") == "true" || query.Get("stream") == "1" {
+			return true
+		}
+		if strings.Contains(r.URL.RawQuery, "stream=true") || strings.Contains(r.URL.RawQuery, "stream=1") {
+			return true
+		}
+	}
+
+	return false
+}
 
 func GenerateRandomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

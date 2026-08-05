@@ -2417,4 +2417,69 @@ func TestDeleteNestedPath(t *testing.T) {
 	}
 }
 
+func TestGeminiBuildTargetURL_Streaming(t *testing.T) {
+	geminiPlugin := plugins.Get("gemini")
+
+	// Case 1: JSON body with stream: true
+	ctx1 := &plugins.Context{
+		UpstreamURL:    "https://generativelanguage.googleapis.com/v1beta/models",
+		ModelName:      "gemini-2.5-flash",
+		RawRequestBody: []byte(`{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+	}
+	req1, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(ctx1.RawRequestBody))
+	req1.Header.Set("Content-Type", "application/json")
+	ctx1.IsStream = plugins.IsStreamRequested(req1, ctx1.RawRequestBody, nil)
+
+	targetURL1 := geminiPlugin.BuildTargetURL(plugins.EndpointChat, req1, ctx1)
+	expected1 := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+	if targetURL1 != expected1 {
+		t.Errorf("Expected streaming URL %q, got %q", expected1, targetURL1)
+	}
+
+	// Case 2: JSON body with stream: false
+	ctx2 := &plugins.Context{
+		UpstreamURL:    "https://generativelanguage.googleapis.com/v1beta/models",
+		ModelName:      "gemini-2.5-flash",
+		RawRequestBody: []byte(`{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"stream":false}`),
+	}
+	req2, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(ctx2.RawRequestBody))
+	req2.Header.Set("Content-Type", "application/json")
+	ctx2.IsStream = plugins.IsStreamRequested(req2, ctx2.RawRequestBody, nil)
+
+	targetURL2 := geminiPlugin.BuildTargetURL(plugins.EndpointChat, req2, ctx2)
+	expected2 := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+	if targetURL2 != expected2 {
+		t.Errorf("Expected non-streaming URL %q, got %q", expected2, targetURL2)
+	}
+
+	// Case 3: JSON body with stream: "true" (string)
+	ctx3 := &plugins.Context{
+		UpstreamURL:    "https://generativelanguage.googleapis.com/v1beta/models",
+		ModelName:      "gemini-2.5-flash",
+		RawRequestBody: []byte(`{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"stream":"true"}`),
+	}
+	req3, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(ctx3.RawRequestBody))
+	req3.Header.Set("Content-Type", "application/json")
+	ctx3.IsStream = plugins.IsStreamRequested(req3, ctx3.RawRequestBody, nil)
+
+	targetURL3 := geminiPlugin.BuildTargetURL(plugins.EndpointChat, req3, ctx3)
+	if targetURL3 != expected1 {
+		t.Errorf("Expected streaming URL %q for string stream, got %q", expected1, targetURL3)
+	}
+
+	// Case 4: Query parameter stream=1
+	ctx4 := &plugins.Context{
+		UpstreamURL: "https://generativelanguage.googleapis.com/v1beta/models",
+		ModelName:   "gemini-2.5-flash",
+	}
+	req4, _ := http.NewRequest("POST", "/v1/chat/completions?stream=1", nil)
+	ctx4.IsStream = plugins.IsStreamRequested(req4, nil, nil)
+
+	targetURL4 := geminiPlugin.BuildTargetURL(plugins.EndpointChat, req4, ctx4)
+	if targetURL4 != expected1 {
+		t.Errorf("Expected streaming URL %q for query parameter stream=1, got %q", expected1, targetURL4)
+	}
+}
+
+
 

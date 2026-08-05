@@ -42,6 +42,11 @@ func buildPluginContext(route *SelectedRoute, r *http.Request, cfg *Config, prox
 		}
 	}
 
+	isStream := false
+	if r != nil {
+		isStream = plugins.IsStreamRequested(r, nil, nil)
+	}
+
 	return &plugins.Context{
 		UpstreamURL:    upstreamURL,
 		ModelName:      modelName,
@@ -50,6 +55,8 @@ func buildPluginContext(route *SelectedRoute, r *http.Request, cfg *Config, prox
 		ReasoningStart: reasoningStart,
 		ReasoningEnd:   reasoningEnd,
 		ReasoningField: reasoningField,
+		IsStream:       isStream,
+		Request:        r,
 		HTTPClient:     httpClient,
 		RequestHeaders: reqHeadersConfig,
 		RequestBody:    reqBodyConfig,

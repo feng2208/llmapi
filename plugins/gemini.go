@@ -33,13 +33,13 @@ func (g *GeminiPlugin) BuildTargetURL(endpoint EndpointType, req *http.Request, 
 	if endpoint == EndpointImageGeneration || endpoint == EndpointImageEdit || endpoint == EndpointAudioSpeech {
 		u += ":generateContent"
 	} else {
-		isStream := ctx.IsStream
-		if req != nil {
-			if req.FormValue("stream") == "true" || req.FormValue("stream") == "1" {
-				isStream = true
-			} else if strings.Contains(req.URL.RawQuery, "stream=true") {
-				isStream = true
-			}
+		var rawBody []byte
+		if ctx != nil {
+			rawBody = ctx.RawRequestBody
+		}
+		isStream := IsStreamRequested(req, rawBody, nil)
+		if ctx != nil && ctx.IsStream {
+			isStream = true
 		}
 		if isStream {
 			u += ":streamGenerateContent"
