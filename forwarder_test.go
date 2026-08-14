@@ -1345,8 +1345,8 @@ func TestGeminiTranslationBypass(t *testing.T) {
 	}
 
 	contents, ok := geminiReq["contents"].([]interface{})
-	if !ok || len(contents) != 1 {
-		t.Fatalf("Expected 1 item in contents, got %v", len(contents))
+	if !ok || len(contents) != 2 {
+		t.Fatalf("Expected 2 items in contents, got %v", len(contents))
 	}
 
 	turn := contents[0].(map[string]interface{})
@@ -1358,6 +1358,11 @@ func TestGeminiTranslationBypass(t *testing.T) {
 	fcPart := parts[0].(map[string]interface{})
 	if fcPart["thoughtSignature"] != "skip_thought_signature_validator" {
 		t.Errorf("Expected thoughtSignature 'skip_thought_signature_validator', got %v", fcPart["thoughtSignature"])
+	}
+
+	turn2 := contents[1].(map[string]interface{})
+	if turn2["role"] != "user" {
+		t.Errorf("Expected turn 2 role user, got %v", turn2["role"])
 	}
 }
 
@@ -2261,6 +2266,69 @@ func TestTransformRequestToGemini_File(t *testing.T) {
 
 	if inlineData["mime_type"] != "application/pdf" {
 		t.Errorf("Expected application/pdf mime_type, got %v", inlineData["mime_type"])
+	}
+}
+
+func TestTransformRequestToGemini_EndingWithModelTurn(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+		},
+	}
+
+	openAIReq := map[string]interface{}{
+		"model": "gpt-4o",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role":    "user",
+				"content": "Hello, please say 1, 2, 3",
+			},
+			map[string]interface{}{
+				"role":    "assistant",
+				"content": "1, 2,",
+			},
+		},
+	}
+
+	reqBytes, err := json.Marshal(openAIReq)
+	if err != nil {
+		t.Fatalf("Failed to marshal OpenAI request: %v", err)
+	}
+
+	translatedBytes, err := plugins.TransformRequestToGemini(reqBytes, nil, buildPluginContext(route, nil, nil, nil))
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(translatedBytes, &geminiReq); err != nil {
+		t.Fatalf("Failed to unmarshal translated Gemini request: %v", err)
+	}
+
+	contents, ok := geminiReq["contents"].([]interface{})
+	if !ok || len(contents) != 3 {
+		t.Fatalf("Expected 3 items in contents, got %v", len(contents))
+	}
+
+	turn1 := contents[0].(map[string]interface{})
+	if turn1["role"] != "user" {
+		t.Errorf("Expected turn 1 role user, got %v", turn1["role"])
+	}
+
+	turn2 := contents[1].(map[string]interface{})
+	if turn2["role"] != "model" {
+		t.Errorf("Expected turn 2 role model, got %v", turn2["role"])
+	}
+
+	turn3 := contents[2].(map[string]interface{})
+	if turn3["role"] != "user" {
+		t.Errorf("Expected turn 3 role user, got %v", turn3["role"])
+	}
+	parts3 := turn3["parts"].([]interface{})
+	if len(parts3) != 1 || parts3[0].(map[string]interface{})["text"] != "Continue" {
+		t.Errorf("Expected turn 3 text Continue, got %v", parts3)
 	}
 }
 

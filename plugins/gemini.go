@@ -743,6 +743,18 @@ func TransformRequestToGemini(rawBody []byte, r *http.Request, ctx *Context) ([]
 		}
 	}
 
+	// Gemini API requires requests to end with a user turn (or tool/functionResponse which is converted to user turn).
+	// If the conversation ends with a model/assistant turn (e.g. prefill or incomplete continuation),
+	// append a user turn to prompt completion.
+	if len(geminiContents) > 0 && geminiContents[len(geminiContents)-1].Role == "model" {
+		geminiContents = append(geminiContents, GeminiContent{
+			Role: "user",
+			Parts: []GeminiPart{
+				{"text": "Continue"},
+			},
+		})
+	}
+
 	if len(geminiContents) > 0 {
 		geminiReq["contents"] = geminiContents
 	}
