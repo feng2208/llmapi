@@ -186,6 +186,48 @@ func (g *GeminiPlugin) TransformResponse(endpoint EndpointType, resp *http.Respo
 	}
 }
 
+// GeminiStreamState holds per-request streaming state for Gemini chat.
+// It buffers the latest upstream usage so a dedicated usage-only chunk
+// can be flushed after the stream ends, and keeps a stable id/created.
+type GeminiStreamState struct {
+	GenID     string
+	Created   int64
+	LastUsage map[string]interface{}
+	HasUsage  bool
+}
+
+func getGeminiStreamState(ctx *Context) *GeminiStreamState {
+	if ctx == nil {
+		return &GeminiStreamState{
+			GenID:   fmt.Sprintf("chatcmpl-%s", GenerateRandomString(12)),
+			Created: time.Now().Unix(),
+		}
+	}
+	if s, ok := ctx.StreamState.(*GeminiStreamState); ok && s != nil {
+		return s
+	}
+	s := &GeminiStreamState{
+		GenID:   fmt.Sprintf("chatcmpl-%s", GenerateRandomString(12)),
+		Created: time.Now().Unix(),
+	}
+	ctx.StreamState = s
+	return s
+}
+
+func cacheGeminiStreamUsage(ctx *Context, payload []byte) {
+	var geminiResp map[string]interface{}
+	if err := json.Unmarshal(payload, &geminiResp); err != nil {
+		return
+	}
+	um, ok := geminiResp["usageMetadata"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	st := getGeminiStreamState(ctx)
+	st.LastUsage = parseGeminiUsage(um)
+	st.HasUsage = true
+}
+
 func (g *GeminiPlugin) TransformStreamChunk(endpoint EndpointType, chunk []byte, ctx *Context) ([]byte, error) {
 	if endpoint == EndpointAudioTranscription {
 		delta, _, err := ProcessGeminiSTTStreamLine(chunk)
@@ -203,8 +245,64 @@ func (g *GeminiPlugin) TransformStreamChunk(endpoint EndpointType, chunk []byte,
 		}
 		return nil, nil
 	}
+	// Swallow upstream [DONE]: final usage chunk + [DONE] are emitted by FinalStreamChunk flush.
+	trimmed := bytes.TrimSpace(chunk)
+	if bytes.HasPrefix(trimmed, []byte("data: ")) {
+		payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+		if string(bytes.TrimSpace(payload)) == "[DONE]" {
+			return nil, nil
+		}
+		// Buffer latest usage; content chunks themselves never carry usage.
+		cacheGeminiStreamUsage(ctx, payload)
+	}
+	st := getGeminiStreamState(ctx)
+	modelName := ""
+	if ctx != nil {
+		modelName = ctx.ModelName
+	}
+	return ProcessGeminiSSELine(chunk, st.GenID, st.Created, modelName), nil
+}
+
+// FinalStreamChunk returns a dedicated usage-only chunk flushed after the
+// upstream stream ends. It always returns a chunk for chat so downstream
+// receives usage exactly once, even when upstream never sent usageMetadata
+// (in which case zero usage is reported).
+func (g *GeminiPlugin) FinalStreamChunk(endpoint EndpointType, ctx *Context) []byte {
+	if endpoint != EndpointChat {
+		return nil
+	}
+	st := getGeminiStreamState(ctx)
+	modelName := ""
+	if ctx != nil {
+		modelName = ctx.ModelName
+	}
+	usage := map[string]interface{}{
+		"prompt_tokens":     0,
+		"completion_tokens": 0,
+		"total_tokens":      0,
+	}
+	if st != nil && st.HasUsage && st.LastUsage != nil {
+		usage = st.LastUsage
+	}
 	genID := fmt.Sprintf("chatcmpl-%s", GenerateRandomString(12))
-	return ProcessGeminiSSELine(chunk, genID, time.Now().Unix(), ctx.ModelName), nil
+	created := time.Now().Unix()
+	if st != nil {
+		genID = st.GenID
+		created = st.Created
+	}
+	openAIChunk := map[string]interface{}{
+		"id":      genID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   modelName,
+		"choices": []interface{}{},
+		"usage":   usage,
+	}
+	b, err := json.Marshal(openAIChunk)
+	if err != nil {
+		return nil
+	}
+	return []byte("data: " + string(b) + "\n\n")
 }
 
 // ----------------------------------------------------------------------------
@@ -880,6 +978,73 @@ func TransformRequestToGemini(rawBody []byte, r *http.Request, ctx *Context) ([]
 	return json.Marshal(geminiReq)
 }
 
+func parseGeminiUsage(um map[string]interface{}) map[string]interface{} {
+	promptTokens := 0
+	candidatesTokens := 0
+	thoughtsTokens := 0
+	totalTokens := 0
+	cachedTokens := 0
+
+	if pt, ok := um["promptTokenCount"].(float64); ok {
+		promptTokens = int(pt)
+	} else if pt, ok := um["prompt_token_count"].(float64); ok {
+		promptTokens = int(pt)
+	}
+
+	if ct, ok := um["candidatesTokenCount"].(float64); ok {
+		candidatesTokens = int(ct)
+	} else if ct, ok := um["candidates_token_count"].(float64); ok {
+		candidatesTokens = int(ct)
+	}
+
+	if th, ok := um["thoughtsTokenCount"].(float64); ok {
+		thoughtsTokens = int(th)
+	} else if th, ok := um["thoughts_token_count"].(float64); ok {
+		thoughtsTokens = int(th)
+	}
+
+	if tt, ok := um["totalTokenCount"].(float64); ok {
+		totalTokens = int(tt)
+	} else if tt, ok := um["total_token_count"].(float64); ok {
+		totalTokens = int(tt)
+	}
+
+	if cct, ok := um["cachedContentTokenCount"].(float64); ok {
+		cachedTokens = int(cct)
+	} else if cct, ok := um["cached_content_token_count"].(float64); ok {
+		cachedTokens = int(cct)
+	}
+
+	completionTokens := candidatesTokens
+	if thoughtsTokens > 0 && promptTokens+candidatesTokens < totalTokens {
+		completionTokens = candidatesTokens + thoughtsTokens
+	}
+
+	if totalTokens == 0 {
+		totalTokens = promptTokens + completionTokens
+	}
+
+	usage := map[string]interface{}{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      totalTokens,
+	}
+
+	if cachedTokens > 0 {
+		usage["prompt_tokens_details"] = map[string]interface{}{
+			"cached_tokens": cachedTokens,
+		}
+	}
+
+	if thoughtsTokens > 0 {
+		usage["completion_tokens_details"] = map[string]interface{}{
+			"reasoning_tokens": thoughtsTokens,
+		}
+	}
+
+	return usage
+}
+
 func ProcessGeminiJSONResponse(rawResp []byte, modelName string) ([]byte, error) {
 	var geminiResp map[string]interface{}
 	if err := json.Unmarshal(rawResp, &geminiResp); err != nil {
@@ -991,15 +1156,7 @@ func ProcessGeminiJSONResponse(rawResp []byte, modelName string) ([]byte, error)
 		"total_tokens":      0,
 	}
 	if um, ok := geminiResp["usageMetadata"].(map[string]interface{}); ok {
-		if pt, ok := um["promptTokenCount"].(float64); ok {
-			usage["prompt_tokens"] = int(pt)
-		}
-		if ct, ok := um["candidatesTokenCount"].(float64); ok {
-			usage["completion_tokens"] = int(ct)
-		}
-		if tt, ok := um["totalTokenCount"].(float64); ok {
-			usage["total_tokens"] = int(tt)
-		}
+		usage = parseGeminiUsage(um)
 	}
 
 	openAIResp := map[string]interface{}{
@@ -1140,23 +1297,9 @@ func ProcessGeminiSSELine(line []byte, genID string, createdTime int64, modelNam
 		"choices": choices,
 	}
 
-	if um, ok := geminiResp["usageMetadata"].(map[string]interface{}); ok {
-		usage := map[string]interface{}{
-			"prompt_tokens":     0,
-			"completion_tokens": 0,
-			"total_tokens":      0,
-		}
-		if pt, ok := um["promptTokenCount"].(float64); ok {
-			usage["prompt_tokens"] = int(pt)
-		}
-		if ct, ok := um["candidatesTokenCount"].(float64); ok {
-			usage["completion_tokens"] = int(ct)
-		}
-		if tt, ok := um["totalTokenCount"].(float64); ok {
-			usage["total_tokens"] = int(tt)
-		}
-		openAIChunk["usage"] = usage
-	}
+	// NOTE: content chunks never carry usage. Usage is buffered in
+	// GeminiStreamState and flushed once as a dedicated final chunk
+	// via FinalStreamChunk.
 
 	modifiedPayload, err := json.Marshal(openAIChunk)
 	if err != nil {
@@ -1296,7 +1439,8 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 	}
 
 	inputTokens := 0
-	outputTokens := 0
+	candidatesTokens := 0
+	thoughtsTokens := 0
 	totalTokens := 0
 
 	if um, ok := geminiResp["usageMetadata"].(map[string]interface{}); ok {
@@ -1307,9 +1451,15 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 		}
 
 		if ct, ok := um["candidatesTokenCount"].(float64); ok {
-			outputTokens = int(ct)
+			candidatesTokens = int(ct)
 		} else if ct, ok := um["candidates_token_count"].(float64); ok {
-			outputTokens = int(ct)
+			candidatesTokens = int(ct)
+		}
+
+		if th, ok := um["thoughtsTokenCount"].(float64); ok {
+			thoughtsTokens = int(th)
+		} else if th, ok := um["thoughts_token_count"].(float64); ok {
+			thoughtsTokens = int(th)
 		}
 
 		if tt, ok := um["totalTokenCount"].(float64); ok {
@@ -1317,6 +1467,14 @@ func ProcessGeminiImageResponse(rawResp []byte, rawRequest []byte) ([]byte, erro
 		} else if tt, ok := um["total_token_count"].(float64); ok {
 			totalTokens = int(tt)
 		}
+	}
+
+	outputTokens := candidatesTokens
+	if thoughtsTokens > 0 && inputTokens+candidatesTokens < totalTokens {
+		outputTokens = candidatesTokens + thoughtsTokens
+	}
+	if totalTokens == 0 {
+		totalTokens = inputTokens + outputTokens
 	}
 
 	openAIResp["usage"] = map[string]interface{}{

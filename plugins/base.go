@@ -27,6 +27,10 @@ type ProviderPlugin interface {
 	// TransformStreamChunk transforms a single SSE line chunk from upstream into OpenAI SSE format.
 	TransformStreamChunk(endpoint EndpointType, chunk []byte, ctx *Context) ([]byte, error)
 
+	// FinalStreamChunk returns a dedicated final SSE chunk (e.g. usage-only chunk)
+	// to be flushed after the upstream stream ends. Returns nil if nothing to flush.
+	FinalStreamChunk(endpoint EndpointType, ctx *Context) []byte
+
 	// BuildTargetURL constructs the destination upstream URL for a request.
 	BuildTargetURL(endpoint EndpointType, req *http.Request, ctx *Context) string
 }
@@ -133,6 +137,10 @@ func (b *BasePlugin) TransformResponse(endpoint EndpointType, resp *http.Respons
 
 func (b *BasePlugin) TransformStreamChunk(endpoint EndpointType, chunk []byte, ctx *Context) ([]byte, error) {
 	return chunk, nil
+}
+
+func (b *BasePlugin) FinalStreamChunk(endpoint EndpointType, ctx *Context) []byte {
+	return nil
 }
 
 func (b *BasePlugin) BuildTargetURL(endpoint EndpointType, req *http.Request, ctx *Context) string {

@@ -88,6 +88,131 @@ func BuildSSELine(payload []byte, originalLine []byte) []byte {
 	return result.Bytes()
 }
 
+// BuildOpenAIErrorBody normalizes any upstream error (Gemini, OpenAI-compatible,
+// or plain text) into OpenAI {"error": {...}} shape while preserving
+// rate-limit / quota details (Retry-After header, RetryInfo.retryDelay,
+// QuotaFailure details).
+func BuildOpenAIErrorBody(statusCode int, respHeader http.Header, rawBody []byte) []byte {
+	retryAfter := ""
+	if respHeader != nil {
+		retryAfter = respHeader.Get("Retry-After")
+	}
+
+	var parsed map[string]interface{}
+	var errObj map[string]interface{}
+	var topMsg string
+	if len(rawBody) > 0 && json.Valid(rawBody) {
+		if err := json.Unmarshal(rawBody, &parsed); err == nil {
+			if e, ok := parsed["error"].(map[string]interface{}); ok {
+				errObj = e
+			} else if s, ok := parsed["error"].(string); ok {
+				topMsg = s
+			}
+			if m, ok := parsed["message"].(string); ok && m != "" {
+				topMsg = m
+			}
+		}
+	}
+
+	message := ""
+	upstreamStatus := ""
+	upstreamType := ""
+	var upstreamDetails interface{}
+	if errObj != nil {
+		if m, ok := errObj["message"].(string); ok && m != "" {
+			message = m
+		}
+		if s, ok := errObj["status"].(string); ok {
+			upstreamStatus = s
+		}
+		if t, ok := errObj["type"].(string); ok {
+			upstreamType = t
+		}
+		if d, ok := errObj["details"]; ok {
+			upstreamDetails = d
+		}
+	}
+	if message == "" {
+		message = topMsg
+	}
+	if message == "" {
+		s := strings.TrimSpace(string(rawBody))
+		if len(s) > 2000 {
+			s = s[:2000] + "..."
+		}
+		message = s
+	}
+	if message == "" {
+		if statusCode != 0 {
+			message = fmt.Sprintf("Upstream request failed with status %d", statusCode)
+		} else {
+			message = "Upstream request failed"
+		}
+	}
+
+	// Extract RetryInfo.retryDelay from Gemini-style details.
+	retryDelay := ""
+	if arr, ok := upstreamDetails.([]interface{}); ok {
+		for _, item := range arr {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := m["@type"].(string); strings.Contains(t, "RetryInfo") {
+				if d, _ := m["retryDelay"].(string); d != "" {
+					retryDelay = d
+					break
+				}
+			}
+		}
+	}
+
+	effectiveRetry := retryAfter
+	if effectiveRetry == "" {
+		effectiveRetry = retryDelay
+	}
+	// Keep retry/quota hints visible to clients that only surface message.
+	if effectiveRetry != "" && !strings.Contains(message, effectiveRetry) {
+		message = fmt.Sprintf("%s (retry after %s)", message, effectiveRetry)
+	}
+
+	errType := "api_error"
+	switch {
+	case statusCode == 429:
+		errType = "rate_limit_error"
+	case statusCode == 401:
+		errType = "authentication_error"
+	case statusCode == 403:
+		errType = "permission_error"
+	case statusCode == 400:
+		errType = "invalid_request_error"
+	}
+	if upstreamType != "" && (statusCode < 400 || errType == "api_error") {
+		errType = upstreamType
+	}
+
+	out := map[string]interface{}{
+		"message": message,
+		"type":    errType,
+		"code":    statusCode,
+	}
+	if effectiveRetry != "" {
+		out["retry_after"] = effectiveRetry
+	}
+	if upstreamStatus != "" {
+		out["upstream_status"] = upstreamStatus
+	}
+	if upstreamDetails != nil {
+		out["upstream_details"] = upstreamDetails
+	}
+
+	b, err := json.Marshal(map[string]interface{}{"error": out})
+	if err != nil {
+		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"api_error","code":%d}}`, message, statusCode))
+	}
+	return b
+}
+
 // DeepMerge merges src map into dst map with slice deduplication and map normalization.
 func DeepMerge(dst, src map[string]interface{}) {
 	for k, v := range src {

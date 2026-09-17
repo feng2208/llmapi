@@ -361,6 +361,34 @@ func executeUpstreamRequest(
 	return route, resp, hCtx, startTime, true
 }
 
+// writeUnifiedUpstreamError normalizes any upstream >=400 response into
+// OpenAI {"error": {...}} shape (preserving Retry-After / quota details via
+// plugins.BuildOpenAIErrorBody) and writes it with the upstream status code.
+// It must be called before any SSE / TransformResponse handling so a failed
+// request never emits content chunks, usage packets, or [DONE].
+func writeUnifiedUpstreamError(w http.ResponseWriter, resp *http.Response, route *SelectedRoute, modelName string, startTime time.Time, label string) {
+	rawErr, _ := io.ReadAll(resp.Body)
+	errBody := plugins.BuildOpenAIErrorBody(resp.StatusCode, resp.Header, rawErr)
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	fmt.Printf("[WARN] Upstream returned HTTP %d. Response body:\n%s\n", resp.StatusCode, strings.TrimSpace(string(rawErr)))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(errBody)))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(errBody)
+
+	provider := ""
+	keyIndex := 0
+	if route != nil {
+		provider = route.ModelProvider.Name
+		keyIndex = route.KeyIndex
+	}
+	elapsed := time.Since(startTime)
+	fmt.Printf("[INFO] [%s] Model=%s Provider=%s Key[%d] %d %s%s\n",
+		time.Now().Format("2006-01-02 15:04:05.000"), modelName, provider, keyIndex, resp.StatusCode, elapsed, label)
+}
+
 func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, proxyMgr *ProxyManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bodyModifier := func(rawBody []byte, route *SelectedRoute, req *http.Request) ([]byte, string, error) {
@@ -371,6 +399,13 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 			return
 		}
 		defer resp.Body.Close()
+
+		// Upstream errors (e.g. 429 after final retry) short-circuit here:
+		// return unified OpenAI error, never SSE chunks / usage packets / [DONE].
+		if resp.StatusCode >= 400 {
+			writeUnifiedUpstreamError(w, resp, route, hCtx.modelName, startTime, "")
+			return
+		}
 
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
@@ -408,6 +443,12 @@ func handleChatCompletions(cfg *Config, stateMgr *StateManager, router *Router, 
 				}
 				if err != nil {
 					break
+				}
+			}
+			if resp.StatusCode < 400 {
+				if finalChunk := p.FinalStreamChunk(plugins.EndpointChat, pluginCtx); finalChunk != nil {
+					_, _ = writer.Write(finalChunk)
+					_, _ = writer.Write([]byte("data: [DONE]\n\n"))
 				}
 			}
 		} else {
@@ -455,6 +496,11 @@ func handleImageGenerations(cfg *Config, stateMgr *StateManager, router *Router,
 			return
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			writeUnifiedUpstreamError(w, resp, route, hCtx.modelName, startTime, " (Image)")
+			return
+		}
 
 		p := plugins.Get(route.ModelProvider.ApiType)
 		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
@@ -506,6 +552,11 @@ func handleImageEdits(cfg *Config, stateMgr *StateManager, router *Router, proxy
 		}
 		defer resp.Body.Close()
 
+		if resp.StatusCode >= 400 {
+			writeUnifiedUpstreamError(w, resp, route, hCtx.modelName, startTime, " (Image Edit)")
+			return
+		}
+
 		p := plugins.Get(route.ModelProvider.ApiType)
 		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
 		pluginCtx.RawRequestBody = hCtx.rawBody
@@ -555,6 +606,11 @@ func handleAudioSpeech(cfg *Config, stateMgr *StateManager, router *Router, prox
 			return
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			writeUnifiedUpstreamError(w, resp, route, hCtx.modelName, startTime, " (Speech)")
+			return
+		}
 
 		p := plugins.Get(route.ModelProvider.ApiType)
 		pluginCtx := buildPluginContext(route, r, cfg, proxyMgr)
@@ -618,6 +674,11 @@ func handleAudioTranscriptions(cfg *Config, stateMgr *StateManager, router *Rout
 			return
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			writeUnifiedUpstreamError(w, resp, route, hCtx.modelName, startTime, " (Transcription)")
+			return
+		}
 
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 

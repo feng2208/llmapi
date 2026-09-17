@@ -927,6 +927,162 @@ func TestGeminiTranslation(t *testing.T) {
 	if c3Choice["finish_reason"] != "tool_calls" {
 		t.Errorf("Expected finish_reason 'tool_calls', got %v", c3Choice["finish_reason"])
 	}
+
+	// 7.4 Test Gemini Usage metadata with thoughtsTokenCount and cachedContentTokenCount
+	usageRespJSON := `{
+		"candidates": [
+			{
+				"content": {
+					"parts": [
+						{"text": "**My Initial Assessment...", "thought": true},
+						{"text": "Hello! How can I help you today?"}
+					],
+					"role": "model"
+				},
+				"finishReason": "STOP",
+				"index": 0
+			}
+		],
+		"usageMetadata": {
+			"promptTokenCount": 2,
+			"candidatesTokenCount": 9,
+			"thoughtsTokenCount": 64,
+			"totalTokenCount": 75,
+			"cachedContentTokenCount": 50
+		}
+	}`
+
+	parsedResp, err := plugins.ProcessGeminiJSONResponse([]byte(usageRespJSON), "gemini-3.8-flash")
+	if err != nil {
+		t.Fatalf("ProcessGeminiJSONResponse failed for usage test: %v", err)
+	}
+
+	var parsedOpenAI map[string]interface{}
+	if err := json.Unmarshal(parsedResp, &parsedOpenAI); err != nil {
+		t.Fatalf("Failed to parse JSON response: %v", err)
+	}
+
+	parsedUsage, ok := parsedOpenAI["usage"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected usage map, got %v", parsedOpenAI["usage"])
+	}
+
+	if parsedUsage["prompt_tokens"].(float64) != 2 {
+		t.Errorf("Expected prompt_tokens 2, got %v", parsedUsage["prompt_tokens"])
+	}
+	// completion_tokens should be 9 + 64 = 73
+	if parsedUsage["completion_tokens"].(float64) != 73 {
+		t.Errorf("Expected completion_tokens 73, got %v", parsedUsage["completion_tokens"])
+	}
+	if parsedUsage["total_tokens"].(float64) != 75 {
+		t.Errorf("Expected total_tokens 75, got %v", parsedUsage["total_tokens"])
+	}
+
+	promptDetails, ok := parsedUsage["prompt_tokens_details"].(map[string]interface{})
+	if !ok || promptDetails["cached_tokens"].(float64) != 50 {
+		t.Errorf("Expected cached_tokens 50, got %v", promptDetails)
+	}
+
+	compDetails, ok := parsedUsage["completion_tokens_details"].(map[string]interface{})
+	if !ok || compDetails["reasoning_tokens"].(float64) != 64 {
+		t.Errorf("Expected reasoning_tokens 64, got %v", compDetails)
+	}
+
+	// 7.5 Test SSE stream: content chunks carry no usage, dedicated final chunk does.
+	// Simulates the two upstream chunks from the issue (both carry usageMetadata).
+	geminiPlugin := &plugins.GeminiPlugin{}
+	streamCtx := &plugins.Context{ModelName: "gemini-3.8-flash"}
+	sseChunk1 := []byte(`data: {"candidates":[{"content":{"parts":[{"text":"Hello! How can I help you today?"}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":9,"totalTokenCount":66,"thoughtsTokenCount":55},"modelVersion":"gemini-3.8-flash"}` + "\n")
+	sseChunk2 := []byte(`data: {"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"EvUCCvICARFN..."}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":9,"totalTokenCount":66,"thoughtsTokenCount":55},"modelVersion":"gemini-3.8-flash"}` + "\n")
+
+	out1, err := geminiPlugin.TransformStreamChunk(plugins.EndpointChat, sseChunk1, streamCtx)
+	if err != nil {
+		t.Fatalf("TransformStreamChunk chunk1 failed: %v", err)
+	}
+	var parsed1 map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(string(out1)), "data: ")), &parsed1); err != nil {
+		t.Fatalf("Failed to unmarshal content chunk1: %v", err)
+	}
+	if _, hasUsage := parsed1["usage"]; hasUsage {
+		t.Errorf("Expected no usage in intermediate content chunk, got %v", parsed1["usage"])
+	}
+
+	out2, err := geminiPlugin.TransformStreamChunk(plugins.EndpointChat, sseChunk2, streamCtx)
+	if err != nil {
+		t.Fatalf("TransformStreamChunk chunk2 failed: %v", err)
+	}
+	var parsed2 map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(string(out2)), "data: ")), &parsed2); err != nil {
+		t.Fatalf("Failed to unmarshal content chunk2: %v", err)
+	}
+	if _, hasUsage := parsed2["usage"]; hasUsage {
+		t.Errorf("Expected no usage in final content chunk, got %v", parsed2["usage"])
+	}
+	// Stable id/created across chunks of the same stream.
+	if parsed1["id"] != parsed2["id"] {
+		t.Errorf("Expected stable chunk id, got %v vs %v", parsed1["id"], parsed2["id"])
+	}
+
+	// Upstream [DONE] is swallowed; final usage + [DONE] come from FinalStreamChunk.
+	if doneOut, _ := geminiPlugin.TransformStreamChunk(plugins.EndpointChat, []byte("data: [DONE]\n"), streamCtx); doneOut != nil {
+		t.Errorf("Expected upstream [DONE] to be swallowed, got %q", string(doneOut))
+	}
+
+	finalChunk := geminiPlugin.FinalStreamChunk(plugins.EndpointChat, streamCtx)
+	if finalChunk == nil {
+		t.Fatalf("Expected dedicated final usage chunk, got nil")
+	}
+	var parsedFinal map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(string(finalChunk)), "data: ")), &parsedFinal); err != nil {
+		t.Fatalf("Failed to unmarshal final usage chunk: %v", err)
+	}
+	if len(parsedFinal["choices"].([]interface{})) != 0 {
+		t.Errorf("Expected empty choices in final usage chunk, got %v", parsedFinal["choices"])
+	}
+	if parsedFinal["id"] != parsed1["id"] {
+		t.Errorf("Expected final chunk id %v to match stream id %v", parsedFinal["id"], parsed1["id"])
+	}
+	sseUsage, ok := parsedFinal["usage"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected usage in final chunk, got %v", parsedFinal["usage"])
+	}
+	if sseUsage["prompt_tokens"].(float64) != 2 {
+		t.Errorf("Expected prompt_tokens 2, got %v", sseUsage["prompt_tokens"])
+	}
+	if sseUsage["completion_tokens"].(float64) != 64 { // 9 + 55
+		t.Errorf("Expected completion_tokens 64, got %v", sseUsage["completion_tokens"])
+	}
+	if sseUsage["total_tokens"].(float64) != 66 {
+		t.Errorf("Expected total_tokens 66, got %v", sseUsage["total_tokens"])
+	}
+	sseCompDetails, ok := sseUsage["completion_tokens_details"].(map[string]interface{})
+	if !ok || sseCompDetails["reasoning_tokens"].(float64) != 55 {
+		t.Errorf("Expected SSE reasoning_tokens 55, got %v", sseCompDetails)
+	}
+
+	// 7.6 Final usage chunk is always sent, even without upstream usageMetadata.
+	emptyCtx := &plugins.Context{ModelName: "gemini-3.8-flash"}
+	plainChunk := []byte(`data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"index":0}]}` + "\n")
+	plainOut, _ := geminiPlugin.TransformStreamChunk(plugins.EndpointChat, plainChunk, emptyCtx)
+	var parsedPlain map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(string(plainOut)), "data: ")), &parsedPlain); err != nil {
+		t.Fatalf("Failed to unmarshal plain chunk: %v", err)
+	}
+	if _, hasUsage := parsedPlain["usage"]; hasUsage {
+		t.Errorf("Expected no usage in plain content chunk, got %v", parsedPlain["usage"])
+	}
+	zeroFinal := geminiPlugin.FinalStreamChunk(plugins.EndpointChat, emptyCtx)
+	if zeroFinal == nil {
+		t.Fatalf("Expected zero usage chunk even without upstream usage, got nil")
+	}
+	var parsedZero map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(string(zeroFinal)), "data: ")), &parsedZero); err != nil {
+		t.Fatalf("Failed to unmarshal zero usage chunk: %v", err)
+	}
+	zeroUsage := parsedZero["usage"].(map[string]interface{})
+	if zeroUsage["prompt_tokens"].(float64) != 0 || zeroUsage["completion_tokens"].(float64) != 0 || zeroUsage["total_tokens"].(float64) != 0 {
+		t.Errorf("Expected zero usage, got %v", zeroUsage)
+	}
 }
 
 // 8. Test deepMerge recursive merging and map normalization
@@ -2546,6 +2702,67 @@ func TestGeminiBuildTargetURL_Streaming(t *testing.T) {
 	targetURL4 := geminiPlugin.BuildTargetURL(plugins.EndpointChat, req4, ctx4)
 	if targetURL4 != expected1 {
 		t.Errorf("Expected streaming URL %q for query parameter stream=1, got %q", expected1, targetURL4)
+	}
+}
+
+func TestBuildOpenAIErrorBody(t *testing.T) {
+	gemini429 := []byte(`{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"12s"}]}}`)
+	hdr := http.Header{}
+	hdr.Set("Retry-After", "12")
+	out := plugins.BuildOpenAIErrorBody(429, hdr, gemini429)
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("error body is not valid JSON: %v", err)
+	}
+	errObj, ok := parsed["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected top-level error object, got %v", parsed)
+	}
+	if errObj["type"] != "rate_limit_error" {
+		t.Errorf("expected type rate_limit_error, got %v", errObj["type"])
+	}
+	if errObj["code"].(float64) != 429 {
+		t.Errorf("expected code 429, got %v", errObj["code"])
+	}
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "quota") || !strings.Contains(msg, "12") {
+		t.Errorf("expected message to retain quota + retry details, got %q", msg)
+	}
+	if errObj["retry_after"] != "12" {
+		t.Errorf("expected retry_after 12, got %v", errObj["retry_after"])
+	}
+	if errObj["upstream_status"] != "RESOURCE_EXHAUSTED" {
+		t.Errorf("expected upstream_status preserved, got %v", errObj["upstream_status"])
+	}
+	if _, ok := errObj["upstream_details"]; !ok {
+		t.Errorf("expected upstream_details preserved, got %v", errObj)
+	}
+	if _, hasUsage := parsed["usage"]; hasUsage {
+		t.Errorf("error body must not contain usage, got %v", parsed["usage"])
+	}
+
+	openai429 := []byte(`{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
+	out2 := plugins.BuildOpenAIErrorBody(429, nil, openai429)
+	var parsed2 map[string]interface{}
+	if err := json.Unmarshal(out2, &parsed2); err != nil {
+		t.Fatalf("openai error body invalid: %v", err)
+	}
+	e2 := parsed2["error"].(map[string]interface{})
+	if e2["message"] != "Rate limit reached" || e2["type"] != "rate_limit_error" {
+		t.Errorf("openai error not preserved: %v", e2)
+	}
+
+	out3 := plugins.BuildOpenAIErrorBody(503, nil, []byte("upstream overloaded"))
+	var parsed3 map[string]interface{}
+	if err := json.Unmarshal(out3, &parsed3); err != nil {
+		t.Fatalf("fallback error body invalid: %v", err)
+	}
+	e3 := parsed3["error"].(map[string]interface{})
+	if !strings.Contains(e3["message"].(string), "overloaded") {
+		t.Errorf("expected raw message preserved, got %v", e3["message"])
+	}
+	if _, hasUsage := parsed3["usage"]; hasUsage {
+		t.Errorf("error body must not contain usage")
 	}
 }
 
