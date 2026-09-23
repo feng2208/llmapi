@@ -2,7 +2,7 @@ package main
 
 import (
 	"errors"
-	"math/rand"
+	"sync"
 )
 
 type SelectedRoute struct {
@@ -12,15 +12,26 @@ type SelectedRoute struct {
 }
 
 type Router struct {
-	cfg   *Config
-	state *StateManager
+	cfg            *Config
+	state          *StateManager
+	mu             sync.Mutex
+	activeKeyIndex map[string]int
 }
 
 func NewRouter(cfg *Config, state *StateManager) *Router {
 	return &Router{
-		cfg:   cfg,
-		state: state,
+		cfg:            cfg,
+		state:          state,
+		activeKeyIndex: make(map[string]int),
 	}
+}
+
+// AdvanceKey advances the active key index for a model-provider pair to the next key.
+func (r *Router) AdvanceKey(modelName, providerName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	mapKey := modelName + ":" + providerName
+	r.activeKeyIndex[mapKey]++
 }
 
 // Find matching ModelConfig
@@ -65,13 +76,19 @@ func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
 
 		numKeys := len(providerConf.AuthKeys)
 
-		// Generate a random permutation of indices (shuffled array from 0 to numKeys-1)
-		indices := rand.Perm(numKeys)
+		mapKey := modelName + ":" + modelProvider.Name
+		r.mu.Lock()
+		currIdx := r.activeKeyIndex[mapKey] % numKeys
+		if currIdx < 0 {
+			currIdx = 0
+		}
+
 		found := false
 		var selectedKey string
 		var selectedIndex int
 
-		for _, idx := range indices {
+		for k := 0; k < numKeys; k++ {
+			idx := (currIdx + k) % numKeys
 			key := providerConf.AuthKeys[idx]
 
 			// Check 429 lock status
@@ -79,28 +96,20 @@ func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
 				continue
 			}
 
-			// Determine which rate limit to apply and check token bucket
-			var limitKey string
-			var limitAmt float64
-
+			// If model-level rate limit is set, check token bucket
 			if modelProvider.RateLimit != nil {
-				// Use Model-specific limit (independent bucket keyed by model name)
-				limitKey = modelName
-				limitAmt = *modelProvider.RateLimit
-			} else {
-				// Use Provider global limit (independent bucket keyed by provider name)
-				limitKey = providerConf.Name
-				limitAmt = providerConf.RateLimit
+				if !r.state.AllowUpstream(key, modelName, *modelProvider.RateLimit) {
+					continue
+				}
 			}
 
-			// If allowed, it consumes a token and we lock down this key
-			if r.state.AllowUpstream(key, limitKey, limitAmt) {
-				selectedKey = key
-				selectedIndex = idx
-				found = true
-				break
-			}
+			selectedKey = key
+			selectedIndex = idx
+			r.activeKeyIndex[mapKey] = idx
+			found = true
+			break
 		}
+		r.mu.Unlock()
 
 		if found {
 			return &SelectedRoute{

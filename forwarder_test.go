@@ -8,7 +8,9 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,14 +98,8 @@ func TestStateManager(t *testing.T) {
 	}
 
 	sm.RecordUpstreamResult(key, 200)
-	sm.mu.RLock()
-	consec := sm.backoffStates[key].consecutive429s
-	sm.mu.RUnlock()
-	if consec != 0 {
-		t.Errorf("Expected consecutive 429s to reset to 0, got %d", consec)
-	}
 
-	// 3 consecutive 429s -> lock until next UTC 00:00
+	// Multiple consecutive 429s -> still lock for 1 minute, NOT next UTC 00:00
 	sm.RecordUpstreamResult(key, 429)
 	sm.RecordUpstreamResult(key, 429)
 	sm.RecordUpstreamResult(key, 429)
@@ -116,11 +112,9 @@ func TestStateManager(t *testing.T) {
 	lockedUntil := sm.backoffStates[key].lockedUntil
 	sm.mu.RUnlock()
 
-	now := time.Now().UTC()
-	expectedMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
-	// They should be equal within 2 second range to avoid tiny timing variations
-	if lockedUntil.Sub(expectedMidnight).Abs() > 2*time.Second {
-		t.Errorf("Expected lockedUntil to be around %v, got %v", expectedMidnight, lockedUntil)
+	expectedLock := time.Now().Add(1 * time.Minute)
+	if lockedUntil.Sub(expectedLock).Abs() > 2*time.Second {
+		t.Errorf("Expected lockedUntil to be around %v (1 min), got %v", expectedLock, lockedUntil)
 	}
 }
 
@@ -145,14 +139,12 @@ func TestRouter(t *testing.T) {
 		},
 		Providers: []ProviderConf{
 			{
-				Name:      "prov-1",
-				RateLimit: 60.0,
-				AuthKeys:  []string{"key-1-a", "key-1-b"},
+				Name:     "prov-1",
+				AuthKeys: []string{"key-1-a", "key-1-b"},
 			},
 			{
-				Name:      "prov-2",
-				RateLimit: 60.0,
-				AuthKeys:  []string{"key-2-a"},
+				Name:     "prov-2",
+				AuthKeys: []string{"key-2-a"},
 			},
 		},
 	}
@@ -160,7 +152,7 @@ func TestRouter(t *testing.T) {
 	sm := NewStateManager()
 	router := NewRouter(cfg, sm)
 
-	// Step 3a: Select route first time. It should pick a valid key of prov-1.
+	// Step 3a: Select route first time. It should pick first key of prov-1: key-1-a.
 	route, err := router.SelectRoute("test-model")
 	if err != nil {
 		t.Fatalf("Failed to select route: %v", err)
@@ -168,36 +160,74 @@ func TestRouter(t *testing.T) {
 	if route.ModelProvider.Name != "prov-1" {
 		t.Errorf("Expected prov-1, got %s", route.ModelProvider.Name)
 	}
-	if route.AuthKey != "key-1-a" && route.AuthKey != "key-1-b" {
-		t.Errorf("Expected route.AuthKey to be either key-1-a or key-1-b, got %s", route.AuthKey)
+	if route.AuthKey != "key-1-a" {
+		t.Errorf("Expected route.AuthKey to be key-1-a, got %s", route.AuthKey)
 	}
 
-	// Step 3b: Select route second time. Since it is random, it should still pick a valid key of prov-1.
+	// Step 3b: Select route second time. Under sticky mode, it should CONTINUE using key-1-a.
 	route2, err := router.SelectRoute("test-model")
 	if err != nil {
 		t.Fatalf("Failed to select route second time: %v", err)
 	}
-	if route2.ModelProvider.Name != "prov-1" {
-		t.Errorf("Expected prov-1, got %s", route2.ModelProvider.Name)
-	}
-	if route2.AuthKey != "key-1-a" && route2.AuthKey != "key-1-b" {
-		t.Errorf("Expected route2.AuthKey to be either key-1-a or key-1-b, got %s", route2.AuthKey)
+	if route2.AuthKey != "key-1-a" {
+		t.Errorf("Expected route2.AuthKey to remain sticky on key-1-a, got %s", route2.AuthKey)
 	}
 
-	// Step 3c: Disable all keys of prov-1 (simulate lock)
+	// Step 3c: Select route third time. Still sticky on key-1-a.
+	route3, err := router.SelectRoute("test-model")
+	if err != nil {
+		t.Fatalf("Failed to select route third time: %v", err)
+	}
+	if route3.AuthKey != "key-1-a" {
+		t.Errorf("Expected route3.AuthKey to remain sticky on key-1-a, got %s", route3.AuthKey)
+	}
+
+	// Step 3d: Lock key-1-a with 429. Next selection should switch to key-1-b.
+	sm.RecordUpstreamResult("key-1-a", 429)
+	route4, err := router.SelectRoute("test-model")
+	if err != nil {
+		t.Fatalf("Failed to select route when key-1-a is locked: %v", err)
+	}
+	if route4.AuthKey != "key-1-b" {
+		t.Errorf("Expected route4.AuthKey to switch to key-1-b, got %s", route4.AuthKey)
+	}
+
+	// Step 3e: Next selection should STAY sticky on key-1-b.
+	route4b, err := router.SelectRoute("test-model")
+	if err != nil {
+		t.Fatalf("Failed to select route: %v", err)
+	}
+	if route4b.AuthKey != "key-1-b" {
+		t.Errorf("Expected route4b.AuthKey to stay sticky on key-1-b, got %s", route4b.AuthKey)
+	}
+
+	// Step 3f: Expire lock on key-1-a. Route should STILL stay on key-1-b because it is sticky.
+	sm.mu.Lock()
+	sm.backoffStates["key-1-a"].lockedUntil = time.Now().Add(-1 * time.Second)
+	sm.mu.Unlock()
+
+	route4c, err := router.SelectRoute("test-model")
+	if err != nil {
+		t.Fatalf("Failed to select route: %v", err)
+	}
+	if route4c.AuthKey != "key-1-b" {
+		t.Errorf("Expected route4c.AuthKey to remain on key-1-b even after key-1-a unlocked, got %s", route4c.AuthKey)
+	}
+
+	// Step 3g: Disable all keys of prov-1 (lock both key-1-a and key-1-b)
 	sm.RecordUpstreamResult("key-1-a", 429)
 	sm.RecordUpstreamResult("key-1-b", 429)
 
 	// Selecting route now should fallback to prov-2 because all keys of prov-1 are locked
-	route3, err := router.SelectRoute("test-model")
+	route5, err := router.SelectRoute("test-model")
 	if err != nil {
 		t.Fatalf("Failed to fallback to prov-2: %v", err)
 	}
-	if route3.ModelProvider.Name != "prov-2" {
-		t.Errorf("Expected fallback to prov-2, got %s", route3.ModelProvider.Name)
+	if route5.ModelProvider.Name != "prov-2" {
+		t.Errorf("Expected fallback to prov-2, got %s", route5.ModelProvider.Name)
 	}
-	if route3.AuthKey != "key-2-a" {
-		t.Errorf("Expected key-2-a, got %s", route3.AuthKey)
+	if route5.AuthKey != "key-2-a" {
+		t.Errorf("Expected key-2-a, got %s", route5.AuthKey)
 	}
 }
 
@@ -2763,6 +2793,217 @@ func TestBuildOpenAIErrorBody(t *testing.T) {
 	}
 	if _, hasUsage := parsed3["usage"]; hasUsage {
 		t.Errorf("error body must not contain usage")
+	}
+}
+
+func TestRetry429AndExhaustion(t *testing.T) {
+	var callLog []string
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		key := strings.TrimPrefix(auth, "Bearer ")
+		mu.Lock()
+		callLog = append(callLog, key)
+		mu.Unlock()
+
+		if key == "key-1" {
+			w.Header().Set("Retry-After", "10")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"key 1 rate limit reached"}}`))
+			return
+		}
+		if key == "key-2" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"chatcmpl-123","choices":[]}`))
+			return
+		}
+		if strings.HasPrefix(key, "fail-") {
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"fail key rate limit reached"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	// Subtest 1: Key 1 fails with 429, retry 1 uses key 2 and succeeds.
+	// Key 1 is frozen for 1 minute, key 2 is not frozen.
+	cfg := &Config{
+		Clients: ClientsConfig{
+			RateLimit: 100,
+			Auth: []ClientAuth{
+				{Name: "client1", Key: "client-key"},
+			},
+		},
+		Models: []ModelConfig{
+			{
+				Name: "retry-model",
+				Providers: []ModelProviderConfig{
+					{
+						Name:     "prov-1",
+						Upstream: ts.URL,
+						Model:    "upstream-model",
+					},
+				},
+			},
+		},
+		Providers: []ProviderConf{
+			{
+				Name:     "prov-1",
+				AuthKeys: []string{"key-1", "key-2"},
+			},
+		},
+	}
+
+	sm := NewStateManager()
+	router := NewRouter(cfg, sm)
+	proxyMgr := NewProxyManager()
+
+	w := httptest.NewRecorder()
+	reqBody := []byte(`{"model":"retry-model","messages":[{"role":"user","content":"hello"}]}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	bodyMod := func(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
+		return rawBody, "application/json", nil
+	}
+
+	route, resp, _, _, ok := executeUpstreamRequest(plugins.EndpointChat, w, req, cfg, sm, router, proxyMgr, bodyMod)
+	if !ok {
+		t.Fatalf("expected ok=true")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK after retry, got %d", resp.StatusCode)
+	}
+	if route.AuthKey != "key-2" {
+		t.Errorf("expected route.AuthKey to be key-2, got %s", route.AuthKey)
+	}
+	if !sm.IsUpstreamLocked("key-1") {
+		t.Errorf("key-1 should be locked for 1 min after 429")
+	}
+	if sm.IsUpstreamLocked("key-2") {
+		t.Errorf("key-2 should not be locked")
+	}
+
+	mu.Lock()
+	if len(callLog) != 2 || callLog[0] != "key-1" || callLog[1] != "key-2" {
+		t.Errorf("unexpected call log: %v", callLog)
+	}
+	callLog = nil
+	mu.Unlock()
+
+	// Subtest 2: Key exhaustion during retry fallback to last failed 429 response
+	// prov-fail has only 2 keys, both fail with 429
+	cfgFail := &Config{
+		Clients: ClientsConfig{
+			RateLimit: 100,
+			Auth: []ClientAuth{
+				{Name: "client1", Key: "client-key"},
+			},
+		},
+		Models: []ModelConfig{
+			{
+				Name: "fail-model",
+				Providers: []ModelProviderConfig{
+					{
+						Name:     "prov-fail",
+						Upstream: ts.URL,
+						Model:    "fail-model",
+					},
+				},
+			},
+		},
+		Providers: []ProviderConf{
+			{
+				Name:     "prov-fail",
+				AuthKeys: []string{"fail-1", "fail-2"},
+			},
+		},
+	}
+
+	smFail := NewStateManager()
+	routerFail := NewRouter(cfgFail, smFail)
+	wFail := httptest.NewRecorder()
+	reqBodyFail := []byte(`{"model":"fail-model","messages":[{"role":"user","content":"hello"}]}`)
+	reqFail := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(reqBodyFail))
+	reqFail.Header.Set("Authorization", "Bearer client-key")
+	reqFail.Header.Set("Content-Type", "application/json")
+
+	routeFail, respFail, _, _, okFail := executeUpstreamRequest(plugins.EndpointChat, wFail, reqFail, cfgFail, smFail, routerFail, proxyMgr, bodyMod)
+	if !okFail {
+		t.Fatalf("expected okFail=true with last failed upstream response")
+	}
+	defer respFail.Body.Close()
+
+	if respFail.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 status code from exhausted retries, got %d", respFail.StatusCode)
+	}
+	if respFail.Header.Get("Retry-After") != "60" {
+		t.Errorf("expected Retry-After header 60 preserved, got %q", respFail.Header.Get("Retry-After"))
+	}
+	bodyFail, _ := io.ReadAll(respFail.Body)
+	if !strings.Contains(string(bodyFail), "fail key rate limit reached") {
+		t.Errorf("expected upstream error body preserved, got %s", string(bodyFail))
+	}
+	if routeFail.AuthKey != "fail-2" {
+		t.Errorf("expected last failed route to be fail-2, got %s", routeFail.AuthKey)
+	}
+
+	// Subtest 3: Max 4 retries (total 5 attempts) when more keys are available
+	cfg5 := &Config{
+		Clients: ClientsConfig{
+			RateLimit: 100,
+			Auth: []ClientAuth{
+				{Name: "client1", Key: "client-key"},
+			},
+		},
+		Models: []ModelConfig{
+			{
+				Name: "five-retries-model",
+				Providers: []ModelProviderConfig{
+					{
+						Name:     "prov-five",
+						Upstream: ts.URL,
+						Model:    "five-model",
+					},
+				},
+			},
+		},
+		Providers: []ProviderConf{
+			{
+				Name:     "prov-five",
+				AuthKeys: []string{"fail-a", "fail-b", "fail-c", "fail-d", "fail-e", "fail-f"},
+			},
+		},
+	}
+
+	sm5 := NewStateManager()
+	router5 := NewRouter(cfg5, sm5)
+	w5 := httptest.NewRecorder()
+	reqBody5 := []byte(`{"model":"five-retries-model","messages":[{"role":"user","content":"hello"}]}`)
+	req5 := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(reqBody5))
+	req5.Header.Set("Authorization", "Bearer client-key")
+	req5.Header.Set("Content-Type", "application/json")
+
+	mu.Lock()
+	callLog = nil
+	mu.Unlock()
+
+	_, resp5, _, _, _ := executeUpstreamRequest(plugins.EndpointChat, w5, req5, cfg5, sm5, router5, proxyMgr, bodyMod)
+	if resp5 != nil {
+		resp5.Body.Close()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Exactly 5 attempts (attempt 0 + 4 retries)
+	if len(callLog) != 5 {
+		t.Errorf("expected exactly 5 attempts (1 initial + 4 retries), got %d: %v", len(callLog), callLog)
 	}
 }
 

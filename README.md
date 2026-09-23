@@ -8,12 +8,13 @@
 *   **智能模型路由与降级 (Fallback)**
     *   根据客户端请求的 `model` 参数自动选择上游渠道。
     *   支持为同一个模型配置多个上游 Provider（按顺序尝试），当前 Provider 节点全部 Auth Key 失效时，自动平滑 fallback 降级到下一个 Provider。
-*   **多 Key 轮询与限流管理**
-    *   单个 Provider 支持配置多个 Auth Key 轮询（Round-Robin）使用。
-    *   **独立限流桶**：支持配置 Model 级限流和 Provider 全局级限流。每个 Key 使用其中一种限流设置，在内存中维护完全独立的 Token Bucket 计数桶，互不干扰。
-*   **精细化 429 惩罚退避策略**
+*   **多 Key 粘性调度与限流管理**
+    *   单个 Provider 支持配置多个 Auth Key。平时持续固定使用当前 Key，直到遭遇 429 冻结或重试时才顺延切换到下一个 Key，且后续请求持续驻留在新 Key 上（粘性游标模式）。
+    *   **独立限流桶**：支持配置 Model 级独立限流。每个 Key 在内存中维护完全独立的 Token Bucket 计数桶，互不干扰；未配置限流的模型不做本地拦截，完全由上游 429 驱动。
+*   **精细化 429 惩罚退避与自动重试策略**
     *   若某个 Auth Key 请求上游遭遇 `429 Too Many Requests`，自动暂停使用该 Key **1分钟**。
-    *   若连续 **3 次** 遭遇 429，则该 Key 将被锁定并暂停使用，直至**次日 UTC 时间 0:00** 自动解锁。
+    *   遇到 429 或 500/503 时，自动按顺序切换其他可用 Key 立即重试，最多重试 **4 次**（总计尝试 5 次）。
+    *   重试若因全部 Key 冻结耗尽，自动透传上游 429 详细报错和 `Retry-After` 信息。
 *   **动态请求体修改**
     *   **删除 (Delete)**：支持从请求体中按键无条件删除特定字段（如 `reasoning_effort`），解决部分模型对不兼容参数报错的问题。
     *   **额外注入 (Extra & Deep Merge)**：支持深度合并（Deep Merge）并向请求体注入额外的参数（如配置 Gemini 的 `thinking_config` 以强制开启深度思考）。
@@ -81,7 +82,7 @@ models:
       - name: gemini
         upstream: https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
         model: gemini-2.5-flash-lite  # 映射到上游的真实模型名称
-        rate_limit: 10                # 针对该 model-key 的独立限流 (每分钟)，缺省则使用 Provider 级限流
+        rate_limit: 10                # 针对该 model 的独立限流 (每分钟)，缺省则不做本地主动限流
         timeout: 120s                 # 请求超时时间
         proxy: socks5://127.0.0.1:1080 # 覆盖全局代理
         reasoning_start: "<thought>"  # 思考块开始标记
@@ -99,7 +100,6 @@ models:
 # 上游提供商凭证
 providers:
   - name: gemini
-    rate_limit: 10           # 全局 Provider 级默认限流 (每分钟)
     auth_keys:
       - AIaaaaaaaaaaaaaaaaaaaa # 支持轮询的多个 API Key
       - AIbbbbbbbbbbbbbbbbbbbb

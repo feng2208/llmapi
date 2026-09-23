@@ -254,15 +254,23 @@ func executeUpstreamRequest(
 	}
 
 	// 5-9. Select route, build request, execute with retry on 429/500/503
-	const maxRetries = 2
+	const maxRetries = 4
 	var route *SelectedRoute
 	var resp *http.Response
+	var lastFailedResp *http.Response
+	var lastFailedRoute *SelectedRoute
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// 5. Select Route (Model/Provider/AuthKey)
 		var err error
 		route, err = router.SelectRoute(modelName)
 		if err != nil {
+			if lastFailedResp != nil {
+				// Retry failed because no more keys are available; fallback to last failed upstream response
+				route = lastFailedRoute
+				resp = lastFailedResp
+				break
+			}
 			fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
 			http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
 			return nil, nil, hCtx, startTime, false
@@ -339,13 +347,28 @@ func executeUpstreamRequest(
 
 		// Check if retry is needed for retryable status codes
 		if (resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503) && attempt < maxRetries {
+			router.AdvanceKey(modelName, route.ModelProvider.Name)
+
+			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			if lastFailedResp != nil && lastFailedResp != resp {
+				lastFailedResp.Body.Close()
+			}
+			lastFailedResp = resp
+			lastFailedRoute = route
+
 			fmt.Printf("[WARN] Upstream (key[%d]) returned %d, retrying with next key (attempt %d/%d)\n",
 				route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
 			startTime = time.Now()
 			continue
 		}
 		break
+	}
+
+	if lastFailedResp != nil && lastFailedResp != resp {
+		lastFailedResp.Body.Close()
 	}
 
 	if debug {

@@ -60,9 +60,8 @@ type RequestBodyConfig struct {
 }
 
 type ProviderConf struct {
-	Name      string   `yaml:"name"`
-	RateLimit float64  `yaml:"rate_limit"` // Requests per minute for single provider
-	AuthKeys  []string `yaml:"auth_keys"`
+	Name     string   `yaml:"name"`
+	AuthKeys []string `yaml:"auth_keys"`
 }
 
 // Timeout parses Duration from ModelProviderConfig.TimeoutStr.

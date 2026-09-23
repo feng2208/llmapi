@@ -69,11 +69,9 @@ models:
 
 providers:
   - name: gemini
-    rate_limit: 10
     auth_keys:
       - AIaaaaaaaaaaaaaaaaaaaa
 
   - name: vertex
-    rate_limit: 10
     auth_keys:
       - AIaabbbbbbbbbbbbbbbbbbbbbb

@@ -8,8 +8,7 @@ import (
 )
 
 type backoffState struct {
-	consecutive429s int
-	lockedUntil     time.Time
+	lockedUntil time.Time
 }
 
 type StateManager struct {
@@ -85,6 +84,10 @@ func (sm *StateManager) AllowUpstream(authKey string, limitKey string, limit flo
 
 // RecordUpstreamResult records HTTP status code for upstream key to update backoff status.
 func (sm *StateManager) RecordUpstreamResult(authKey string, statusCode int) {
+	if statusCode != 429 {
+		return
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -94,20 +97,8 @@ func (sm *StateManager) RecordUpstreamResult(authKey string, statusCode int) {
 		sm.backoffStates[authKey] = state
 	}
 
-	if statusCode == 429 {
-		state.consecutive429s++
-		if state.consecutive429s >= 3 {
-			// Lock until next UTC 00:00
-			now := time.Now().UTC()
-			nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
-			state.lockedUntil = nextMidnight
-		} else {
-			// Lock for 1 minute
-			state.lockedUntil = time.Now().Add(1 * time.Minute)
-		}
-	} else if statusCode == 200 {
-		state.consecutive429s = 0
-	}
+	// Lock for 1 minute
+	state.lockedUntil = time.Now().Add(1 * time.Minute)
 }
 
 // IsUpstreamLocked checks if the key is locked due to 429 backoff.
