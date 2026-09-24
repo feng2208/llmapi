@@ -3007,5 +3007,171 @@ func TestRetry429AndExhaustion(t *testing.T) {
 	}
 }
 
+func TestGeminiGroundingAnnotations_JSON(t *testing.T) {
+	geminiRespJSON := `{
+		"candidates": [
+			{
+				"content": {
+					"parts": [
+						{"text": "According to Google Search, today's weather is sunny."}
+					],
+					"role": "model"
+				},
+				"finishReason": "STOP",
+				"index": 0,
+				"groundingMetadata": {
+					"webSearchQueries": ["today weather"],
+					"groundingChunks": [
+						{
+							"web": {
+								"uri": "https://weather.com/today",
+								"title": "Weather Today"
+							}
+						},
+						{
+							"web": {
+								"uri": "https://unused-search.com",
+								"title": "Unused Source"
+							}
+						}
+					],
+					"groundingSupports": [
+						{
+							"groundingChunkIndices": [0],
+							"segment": {
+								"startIndex": 0,
+								"endIndex": 53,
+								"text": "According to Google Search, today's weather is sunny."
+							}
+						}
+					]
+				}
+			}
+		],
+		"usageMetadata": {
+			"promptTokenCount": 10,
+			"candidatesTokenCount": 20,
+			"totalTokenCount": 30
+		}
+	}`
+
+	out, err := plugins.ProcessGeminiJSONResponse([]byte(geminiRespJSON), "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("ProcessGeminiJSONResponse failed: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal OpenAI response: %v", err)
+	}
+
+	choices, ok := parsed["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		t.Fatalf("choices missing or empty")
+	}
+
+	c0 := choices[0].(map[string]interface{})
+	msg := c0["message"].(map[string]interface{})
+	if msg["content"] != "According to Google Search, today's weather is sunny." {
+		t.Errorf("content was modified, got: %v", msg["content"])
+	}
+
+	annos, ok := msg["annotations"].([]interface{})
+	if !ok {
+		t.Fatalf("annotations missing from message: %v", msg)
+	}
+
+	// Strictly only 1 annotation (for the supported chunk 0), unused chunk 1 must not be generated
+	if len(annos) != 1 {
+		t.Fatalf("expected exactly 1 annotation, got %d: %v", len(annos), annos)
+	}
+
+	anno0 := annos[0].(map[string]interface{})
+	if anno0["type"] != "url_citation" {
+		t.Errorf("expected type 'url_citation', got %v", anno0["type"])
+	}
+
+	citation, ok := anno0["url_citation"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("url_citation missing in annotation: %v", anno0)
+	}
+
+	if citation["title"] != "Weather Today" {
+		t.Errorf("expected title 'Weather Today', got %v", citation["title"])
+	}
+	if citation["url"] != "https://weather.com/today" {
+		t.Errorf("expected url 'https://weather.com/today', got %v", citation["url"])
+	}
+	if citation["start_index"] != float64(0) {
+		t.Errorf("expected start_index 0, got %v", citation["start_index"])
+	}
+	if citation["end_index"] != float64(53) {
+		t.Errorf("expected end_index 53, got %v", citation["end_index"])
+	}
+}
+
+func TestGeminiGroundingAnnotations_Stream(t *testing.T) {
+	geminiChunkJSON := `data: {"candidates":[{"content":{"parts":[{"text":"Done."}]},"finishReason":"STOP","index":0,"groundingMetadata":{"groundingChunks":[{"web":{"title":"Search Page","uri":"https://example.com/search"}}],"groundingSupports":[{"groundingChunkIndices":[0],"segment":{"startIndex":0,"endIndex":5}}]}}]}`
+
+	out := plugins.ProcessGeminiSSELine([]byte(geminiChunkJSON), "chatcmpl-test", 12345678, "gemini-2.5-flash")
+	if len(out) == 0 {
+		t.Fatalf("expected non-empty output")
+	}
+
+	trimmed := bytes.TrimSpace(out)
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		t.Fatalf("expected data: prefix, got: %s", string(out))
+	}
+
+	payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+	var chunk map[string]interface{}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("failed to unmarshal stream chunk: %v", err)
+	}
+
+	choices, ok := chunk["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		t.Fatalf("choices missing or empty in chunk: %v", chunk)
+	}
+
+	c0 := choices[0].(map[string]interface{})
+	delta, ok := c0["delta"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("delta missing in choice: %v", c0)
+	}
+
+	if delta["content"] != "Done." {
+		t.Errorf("expected delta content 'Done.', got: %v", delta["content"])
+	}
+
+	annos, ok := delta["annotations"].([]interface{})
+	if !ok || len(annos) != 1 {
+		t.Fatalf("expected 1 delta annotation, got: %v", delta["annotations"])
+	}
+
+	anno0 := annos[0].(map[string]interface{})
+	if anno0["type"] != "url_citation" {
+		t.Errorf("expected type 'url_citation', got %v", anno0["type"])
+	}
+
+	citation, ok := anno0["url_citation"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("url_citation missing in annotation: %v", anno0)
+	}
+
+	if citation["title"] != "Search Page" {
+		t.Errorf("expected title 'Search Page', got %v", citation["title"])
+	}
+	if citation["url"] != "https://example.com/search" {
+		t.Errorf("expected url 'https://example.com/search', got %v", citation["url"])
+	}
+	if citation["start_index"] != float64(0) {
+		t.Errorf("expected start_index 0, got %v", citation["start_index"])
+	}
+	if citation["end_index"] != float64(5) {
+		t.Errorf("expected end_index 5, got %v", citation["end_index"])
+	}
+}
+
 
 

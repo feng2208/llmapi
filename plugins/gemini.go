@@ -1045,6 +1045,88 @@ func parseGeminiUsage(um map[string]interface{}) map[string]interface{} {
 	return usage
 }
 
+// parseGeminiGroundingAnnotations converts Gemini groundingMetadata into OpenAI url_citation annotations.
+// It strictly maps groundingSupports segments and their associated groundingChunks.
+func parseGeminiGroundingAnnotations(groundingMetadata map[string]interface{}) []map[string]interface{} {
+	if groundingMetadata == nil {
+		return nil
+	}
+
+	chunksRaw, _ := groundingMetadata["groundingChunks"].([]interface{})
+	if len(chunksRaw) == 0 {
+		return nil
+	}
+
+	type webChunk struct {
+		title string
+		url   string
+	}
+	chunks := make([]webChunk, len(chunksRaw))
+	for i, c := range chunksRaw {
+		if cMap, ok := c.(map[string]interface{}); ok {
+			if web, ok := cMap["web"].(map[string]interface{}); ok {
+				title, _ := web["title"].(string)
+				uri, _ := web["uri"].(string)
+				chunks[i] = webChunk{title: title, url: uri}
+			}
+		}
+	}
+
+	supportsRaw, _ := groundingMetadata["groundingSupports"].([]interface{})
+	if len(supportsRaw) == 0 {
+		return nil
+	}
+
+	var annotations []map[string]interface{}
+	for _, s := range supportsRaw {
+		sMap, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		startIndex := 0
+		endIndex := 0
+		if seg, ok := sMap["segment"].(map[string]interface{}); ok {
+			if si, ok := seg["startIndex"].(float64); ok {
+				startIndex = int(si)
+			}
+			if ei, ok := seg["endIndex"].(float64); ok {
+				endIndex = int(ei)
+			}
+		}
+
+		chunkIndices, _ := sMap["groundingChunkIndices"].([]interface{})
+		for _, ci := range chunkIndices {
+			var idx int
+			switch v := ci.(type) {
+			case float64:
+				idx = int(v)
+			case int:
+				idx = v
+			default:
+				continue
+			}
+
+			if idx >= 0 && idx < len(chunks) {
+				c := chunks[idx]
+				if c.url != "" || c.title != "" {
+					annotations = append(annotations, map[string]interface{}{
+						"type": "url_citation",
+						"url_citation": map[string]interface{}{
+							"start_index": startIndex,
+							"end_index":   endIndex,
+							"title":       c.title,
+							"url":         c.url,
+						},
+					})
+				}
+			}
+		}
+	}
+
+	return annotations
+}
+
 func ProcessGeminiJSONResponse(rawResp []byte, modelName string) ([]byte, error) {
 	var geminiResp map[string]interface{}
 	if err := json.Unmarshal(rawResp, &geminiResp); err != nil {
@@ -1140,6 +1222,17 @@ func ProcessGeminiJSONResponse(rawResp []byte, modelName string) ([]byte, error)
 			message["tool_calls"] = toolCalls
 			if contentText == "" {
 				message["content"] = nil
+			}
+		}
+
+		// Parse Google Search Grounding metadata into OpenAI annotations
+		if gm, ok := candMap["groundingMetadata"].(map[string]interface{}); ok {
+			if annos := parseGeminiGroundingAnnotations(gm); len(annos) > 0 {
+				message["annotations"] = annos
+			}
+		} else if gm, ok := geminiResp["groundingMetadata"].(map[string]interface{}); ok {
+			if annos := parseGeminiGroundingAnnotations(gm); len(annos) > 0 {
+				message["annotations"] = annos
 			}
 		}
 
@@ -1276,6 +1369,16 @@ func ProcessGeminiSSELine(line []byte, genID string, createdTime int64, modelNam
 		}
 		if len(toolCalls) > 0 {
 			delta["tool_calls"] = toolCalls
+		}
+		// Parse Google Search Grounding metadata into OpenAI annotations
+		if gm, ok := candMap["groundingMetadata"].(map[string]interface{}); ok {
+			if annos := parseGeminiGroundingAnnotations(gm); len(annos) > 0 {
+				delta["annotations"] = annos
+			}
+		} else if gm, ok := geminiResp["groundingMetadata"].(map[string]interface{}); ok {
+			if annos := parseGeminiGroundingAnnotations(gm); len(annos) > 0 {
+				delta["annotations"] = annos
+			}
 		}
 
 		choices = append(choices, map[string]interface{}{
