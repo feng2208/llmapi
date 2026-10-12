@@ -375,15 +375,39 @@ func parseImageUrlPart(urlStr string) (map[string]interface{}, error) {
 	return nil, fmt.Errorf("unsupported image URL format")
 }
 
-func cleanGeminiSchema(schema interface{}) interface{} {
+func CleanGeminiSchema(schema interface{}) interface{} {
 	m, ok := schema.(map[string]interface{})
 	if !ok {
 		return schema
 	}
 
 	cleaned := make(map[string]interface{})
+
+	// 1. Handle "const": OpenAPI 3.0 / Gemini Schema does not support const, convert to enum: [v]
+	if constVal, ok := m["const"]; ok {
+		if _, hasEnum := m["enum"]; !hasEnum {
+			var enumArr []interface{}
+			if s, ok := constVal.(string); ok {
+				enumArr = []interface{}{s}
+			} else {
+				enumArr = []interface{}{fmt.Sprintf("%v", constVal)}
+			}
+			cleaned["enum"] = enumArr
+		}
+		if _, hasType := m["type"]; !hasType {
+			switch constVal.(type) {
+			case string:
+				cleaned["type"] = "STRING"
+			case bool:
+				cleaned["type"] = "BOOLEAN"
+			case int, int64, int32, float64, float32:
+				cleaned["type"] = "NUMBER"
+			}
+		}
+	}
+
 	for k, v := range m {
-		if k == "$schema" || k == "$id" || k == "$vocabulary" || k == "$anchor" || k == "additionalProperties" || k == "exclusiveMinimum" {
+		if k == "$schema" || k == "$id" || k == "$vocabulary" || k == "$anchor" || k == "additionalProperties" || k == "exclusiveMinimum" || k == "exclusiveMaximum" || k == "const" {
 			continue
 		}
 
@@ -394,11 +418,26 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 			}
 		}
 
+		if k == "enum" {
+			if enumArr, ok := v.([]interface{}); ok {
+				cleanedArr := make([]interface{}, 0, len(enumArr))
+				for _, elem := range enumArr {
+					if s, ok := elem.(string); ok {
+						cleanedArr = append(cleanedArr, s)
+					} else {
+						cleanedArr = append(cleanedArr, fmt.Sprintf("%v", elem))
+					}
+				}
+				cleaned[k] = cleanedArr
+				continue
+			}
+		}
+
 		if k == "properties" || k == "$defs" || k == "definitions" {
 			if propsMap, ok := v.(map[string]interface{}); ok {
 				cleanedProps := make(map[string]interface{})
 				for propName, propVal := range propsMap {
-					cleanedProps[propName] = cleanGeminiSchema(propVal)
+					cleanedProps[propName] = CleanGeminiSchema(propVal)
 				}
 				cleaned[k] = cleanedProps
 				continue
@@ -407,25 +446,26 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 
 		if k == "items" {
 			if itemMap, ok := v.(map[string]interface{}); ok {
-				cleaned[k] = cleanGeminiSchema(itemMap)
+				cleaned[k] = CleanGeminiSchema(itemMap)
 				continue
 			} else if itemArr, ok := v.([]interface{}); ok {
 				cleanedArr := make([]interface{}, 0, len(itemArr))
 				for _, elem := range itemArr {
-					cleanedArr = append(cleanedArr, cleanGeminiSchema(elem))
+					cleanedArr = append(cleanedArr, CleanGeminiSchema(elem))
 				}
 				cleaned[k] = cleanedArr
 				continue
 			}
 		}
 
-		if k == "allOf" || k == "anyOf" || k == "oneOf" || k == "prefixItems" {
+		if k == "anyOf" || k == "oneOf" || k == "allOf" {
+			targetKey := "anyOf" // Gemini Schema only supports anyOf
 			if schemaArr, ok := v.([]interface{}); ok {
 				cleanedArr := make([]interface{}, 0, len(schemaArr))
 				for _, elem := range schemaArr {
-					cleanedArr = append(cleanedArr, cleanGeminiSchema(elem))
+					cleanedArr = append(cleanedArr, CleanGeminiSchema(elem))
 				}
-				cleaned[k] = cleanedArr
+				cleaned[targetKey] = cleanedArr
 				continue
 			}
 		}
@@ -433,6 +473,10 @@ func cleanGeminiSchema(schema interface{}) interface{} {
 		cleaned[k] = v
 	}
 	return cleaned
+}
+
+func cleanGeminiSchema(schema interface{}) interface{} {
+	return CleanGeminiSchema(schema)
 }
 
 func DetectMimeTypeFromContent(data []byte) string {
@@ -963,7 +1007,7 @@ func TransformRequestToGemini(rawBody []byte, r *http.Request, ctx *Context) ([]
 			generationConfig["responseMimeType"] = "application/json"
 			if jsonSchema, ok := responseFormat["json_schema"].(map[string]interface{}); ok {
 				if schema, ok := jsonSchema["schema"]; ok {
-					generationConfig["responseSchema"] = schema
+					generationConfig["responseSchema"] = cleanGeminiSchema(schema)
 				}
 			}
 		}

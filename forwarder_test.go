@@ -3173,5 +3173,248 @@ func TestGeminiGroundingAnnotations_Stream(t *testing.T) {
 	}
 }
 
+// 22. Test CleanGeminiSchema handling of const, enum, unsupported keywords, and responseSchema
+func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
+	// A. Test direct CleanGeminiSchema
+	schemaInput := map[string]interface{}{
+		"$schema":              "http://json-schema.org/draft-07/schema#",
+		"additionalProperties": false,
+		"exclusiveMinimum":     0,
+		"exclusiveMaximum":     100,
+		"type":                 "object",
+		"properties": map[string]interface{}{
+			"mode": map[string]interface{}{
+				"const": "base64",
+				"type":  "string",
+			},
+			"count": map[string]interface{}{
+				"const": 10,
+			},
+			"active": map[string]interface{}{
+				"const": true,
+			},
+			"tags": map[string]interface{}{
+				"type": "array",
+				"items": map[string]interface{}{
+					"enum": []interface{}{1, "prod", true},
+				},
+			},
+			"unionField": map[string]interface{}{
+				"oneOf": []interface{}{
+					map[string]interface{}{"type": "string"},
+					map[string]interface{}{"type": "number"},
+				},
+			},
+		},
+	}
+
+	cleaned := plugins.CleanGeminiSchema(schemaInput).(map[string]interface{})
+
+	// Check top-level filtering
+	for _, illegal := range []string{"$schema", "additionalProperties", "exclusiveMinimum", "exclusiveMaximum"} {
+		if _, ok := cleaned[illegal]; ok {
+			t.Errorf("Expected %s to be stripped from top level", illegal)
+		}
+	}
+	if cleaned["type"] != "OBJECT" {
+		t.Errorf("Expected top-level type 'OBJECT', got %v", cleaned["type"])
+	}
+
+	props := cleaned["properties"].(map[string]interface{})
+
+	// Check "mode" (const: "base64" -> enum: ["base64"], no const)
+	modeProp := props["mode"].(map[string]interface{})
+	if _, ok := modeProp["const"]; ok {
+		t.Errorf("Expected const to be removed from mode property")
+	}
+	if modeProp["type"] != "STRING" {
+		t.Errorf("Expected type 'STRING', got %v", modeProp["type"])
+	}
+	modeEnum, ok := modeProp["enum"].([]interface{})
+	if !ok || len(modeEnum) != 1 || modeEnum[0] != "base64" {
+		t.Errorf("Expected enum [\"base64\"], got %v", modeProp["enum"])
+	}
+
+	// Check "count" (const: 10, no type -> type: NUMBER, enum: ["10"])
+	countProp := props["count"].(map[string]interface{})
+	if _, ok := countProp["const"]; ok {
+		t.Errorf("Expected const to be removed from count property")
+	}
+	if countProp["type"] != "NUMBER" {
+		t.Errorf("Expected inferred type 'NUMBER', got %v", countProp["type"])
+	}
+	countEnum, ok := countProp["enum"].([]interface{})
+	if !ok || len(countEnum) != 1 || countEnum[0] != "10" {
+		t.Errorf("Expected enum [\"10\"], got %v", countProp["enum"])
+	}
+
+	// Check "active" (const: true, no type -> type: BOOLEAN, enum: ["true"])
+	activeProp := props["active"].(map[string]interface{})
+	if activeProp["type"] != "BOOLEAN" {
+		t.Errorf("Expected inferred type 'BOOLEAN', got %v", activeProp["type"])
+	}
+	activeEnum, ok := activeProp["enum"].([]interface{})
+	if !ok || len(activeEnum) != 1 || activeEnum[0] != "true" {
+		t.Errorf("Expected enum [\"true\"], got %v", activeProp["enum"])
+	}
+
+	// Check "tags.items.enum" normalization
+	tagsItems := props["tags"].(map[string]interface{})["items"].(map[string]interface{})
+	tagEnum := tagsItems["enum"].([]interface{})
+	if len(tagEnum) != 3 || tagEnum[0] != "1" || tagEnum[1] != "prod" || tagEnum[2] != "true" {
+		t.Errorf("Expected normalized string enum [\"1\", \"prod\", \"true\"], got %v", tagEnum)
+	}
+
+	// Check oneOf converted to anyOf
+	unionField := props["unionField"].(map[string]interface{})
+	if _, ok := unionField["oneOf"]; ok {
+		t.Errorf("Expected oneOf to be converted to anyOf")
+	}
+	anyOfList, ok := unionField["anyOf"].([]interface{})
+	if !ok || len(anyOfList) != 2 {
+		t.Errorf("Expected anyOf with 2 elements, got %v", unionField["anyOf"])
+	}
+
+	// B. Test real-world "create_skill" request with TransformRequestToGemini
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+		},
+	}
+	reqJSON := `{
+		"model": "gemini-2.5-flash",
+		"messages": [{"role": "user", "content": "Create skill"}],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "create_skill",
+					"description": "Create a private workspace skill with SKILL.md and optional UTF-8 supporting files. No terminal is needed.",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"commit_message": {
+								"type": "string",
+								"description": "Optional description of this save."
+							},
+							"content": {
+								"type": "string",
+								"description": "Complete SKILL.md text, including name and description frontmatter."
+							},
+							"files": {
+								"type": "array",
+								"description": "Optional supporting files, each with path and content. UTF-8 text only.",
+								"items": {
+									"type": "object",
+									"additionalProperties": false,
+									"properties": {
+										"content": {
+											"type": "string"
+										},
+										"encoding": {
+											"const": "base64",
+											"type": "string"
+										},
+										"path": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"path",
+										"content"
+									]
+								}
+							},
+							"id": {
+								"type": "string",
+								"description": "Unique lowercase skill slug."
+							},
+							"name": {
+								"type": "string",
+								"description": "Display name."
+							}
+						},
+						"required": [
+							"id",
+							"name",
+							"content"
+						]
+					}
+				}
+			}
+		],
+		"response_format": {
+			"type": "json_schema",
+			"json_schema": {
+				"name": "output_schema",
+				"schema": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"status": {
+							"const": "ok",
+							"type": "string"
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	transformed, err := plugins.TransformRequestToGemini([]byte(reqJSON), nil, buildPluginContext(route, nil, nil, nil))
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(transformed, &geminiReq); err != nil {
+		t.Fatalf("Failed to parse transformed request: %v", err)
+	}
+
+	// Verify tools
+	toolsList := geminiReq["tools"].([]interface{})
+	decl := toolsList[0].(map[string]interface{})["functionDeclarations"].([]interface{})[0].(map[string]interface{})
+	if decl["name"] != "create_skill" {
+		t.Errorf("Expected function declaration name 'create_skill', got %v", decl["name"])
+	}
+	createSkillParams := decl["parameters"].(map[string]interface{})
+	filesProp := createSkillParams["properties"].(map[string]interface{})["files"].(map[string]interface{})
+	fileItems := filesProp["items"].(map[string]interface{})
+	if _, ok := fileItems["additionalProperties"]; ok {
+		t.Errorf("Expected items.additionalProperties to be cleaned")
+	}
+	encodingProp := fileItems["properties"].(map[string]interface{})["encoding"].(map[string]interface{})
+	if _, ok := encodingProp["const"]; ok {
+		t.Errorf("Expected encoding.const to be removed")
+	}
+	if encodingProp["type"] != "STRING" {
+		t.Errorf("Expected encoding.type to be STRING, got %v", encodingProp["type"])
+	}
+	encEnum, ok := encodingProp["enum"].([]interface{})
+	if !ok || len(encEnum) != 1 || encEnum[0] != "base64" {
+		t.Errorf("Expected encoding.enum to be [\"base64\"], got %v", encodingProp["enum"])
+	}
+
+	// Verify response_format -> generationConfig.responseSchema
+	genConfig := geminiReq["generationConfig"].(map[string]interface{})
+	respSchema, ok := genConfig["responseSchema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected responseSchema in generationConfig")
+	}
+	if _, ok := respSchema["additionalProperties"]; ok {
+		t.Errorf("Expected additionalProperties stripped from responseSchema")
+	}
+	statusProp := respSchema["properties"].(map[string]interface{})["status"].(map[string]interface{})
+	if _, ok := statusProp["const"]; ok {
+		t.Errorf("Expected const stripped from responseSchema.properties.status")
+	}
+	statusEnum, ok := statusProp["enum"].([]interface{})
+	if !ok || len(statusEnum) != 1 || statusEnum[0] != "ok" {
+		t.Errorf("Expected status enum [\"ok\"], got %v", statusProp["enum"])
+	}
+}
+
 
 
