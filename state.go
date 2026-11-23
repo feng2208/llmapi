@@ -84,7 +84,7 @@ func (sm *StateManager) AllowUpstream(authKey string, limitKey string, limit flo
 
 // RecordUpstreamResult records HTTP status code for upstream key to update backoff status.
 func (sm *StateManager) RecordUpstreamResult(authKey string, statusCode int) {
-	if statusCode != 429 {
+	if statusCode != 429 && statusCode != 401 && statusCode != 403 {
 		return
 	}
 

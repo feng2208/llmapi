@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"sync"
 )
 
@@ -55,8 +56,9 @@ func (r *Router) findProviderConf(providerName string) *ProviderConf {
 }
 
 // SelectRoute chooses the best provider and auth key for the requested model.
+// Optional excludeKeys allows callers to exclude keys already attempted in the current request.
 // Returns SelectedRoute or an error if no upstreams are available.
-func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
+func (r *Router) SelectRoute(modelName string, excludeKeys ...map[string]bool) (*SelectedRoute, error) {
 	modelCfg := r.findModelConfig(modelName)
 	if modelCfg == nil {
 		return nil, errors.New("model not found")
@@ -64,6 +66,11 @@ func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
 
 	if len(modelCfg.Providers) == 0 {
 		return nil, errors.New("no providers configured for this model")
+	}
+
+	var excluded map[string]bool
+	if len(excludeKeys) > 0 && excludeKeys[0] != nil {
+		excluded = excludeKeys[0]
 	}
 
 	// Iterate through the model's providers in order
@@ -90,6 +97,16 @@ func (r *Router) SelectRoute(modelName string) (*SelectedRoute, error) {
 		for k := 0; k < numKeys; k++ {
 			idx := (currIdx + k) % numKeys
 			key := providerConf.AuthKeys[idx]
+
+			// Skip empty keys
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+
+			// Check if key has already been attempted in this request
+			if excluded != nil && excluded[key] {
+				continue
+			}
 
 			// Check 429 lock status
 			if r.state.IsUpstreamLocked(key) {

@@ -3622,5 +3622,311 @@ func TestGeminiTools_ExamplesConversion(t *testing.T) {
 	}
 }
 
+func TestRouter_ExcludeKeys(t *testing.T) {
+	cfg := &Config{
+		Models: []ModelConfig{
+			{
+				Name: "multi-model",
+				Providers: []ModelProviderConfig{
+					{
+						Name:  "prov-1",
+						Model: "upstream-1",
+					},
+					{
+						Name:  "prov-2",
+						Model: "upstream-2",
+					},
+				},
+			},
+		},
+		Providers: []ProviderConf{
+			{
+				Name:     "prov-1",
+				AuthKeys: []string{"key-1-a", "key-1-b", "   "},
+			},
+			{
+				Name:     "prov-2",
+				AuthKeys: []string{"key-2-a"},
+			},
+		},
+	}
+
+	sm := NewStateManager()
+	router := NewRouter(cfg, sm)
+
+	// Step 1: Normal route selection picks key-1-a from prov-1
+	r1, err := router.SelectRoute("multi-model")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r1.ModelProvider.Name != "prov-1" || r1.AuthKey != "key-1-a" {
+		t.Errorf("expected prov-1 with key-1-a, got %s / %s", r1.ModelProvider.Name, r1.AuthKey)
+	}
+
+	// Step 2: Exclude key-1-a, should pick key-1-b from prov-1
+	excluded := map[string]bool{"key-1-a": true}
+	r2, err := router.SelectRoute("multi-model", excluded)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r2.ModelProvider.Name != "prov-1" || r2.AuthKey != "key-1-b" {
+		t.Errorf("expected prov-1 with key-1-b, got %s / %s", r2.ModelProvider.Name, r2.AuthKey)
+	}
+
+	// Step 3: Exclude both key-1-a and key-1-b. "   " is skipped because it's whitespace.
+	// Prov-1 has no more available keys -> MUST fallback to prov-2 key-2-a!
+	excluded["key-1-b"] = true
+	r3, err := router.SelectRoute("multi-model", excluded)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r3.ModelProvider.Name != "prov-2" || r3.AuthKey != "key-2-a" {
+		t.Errorf("expected fallback to prov-2 with key-2-a, got %s / %s", r3.ModelProvider.Name, r3.AuthKey)
+	}
+
+	// Step 4: Exclude key-2-a as well -> all providers/keys exhausted
+	excluded["key-2-a"] = true
+	_, err = router.SelectRoute("multi-model", excluded)
+	if err == nil {
+		t.Fatalf("expected error when all keys are excluded")
+	}
+}
+
+func TestRetryAcrossProviders(t *testing.T) {
+	var callLog []string
+	var mu sync.Mutex
+
+	tsProv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		key := strings.TrimPrefix(auth, "Bearer ")
+		mu.Lock()
+		callLog = append(callLog, "prov1:"+key)
+		mu.Unlock()
+
+		if key == "p1-500" {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":{"message":"internal error from prov1"}}`))
+			return
+		}
+		if key == "p1-401" {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"message":"unauthorized key"}}`))
+			return
+		}
+		if key == "p1-403" {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"error":{"message":"forbidden key"}}`))
+			return
+		}
+		if key == "p1-429" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"chatcmpl-prov1","choices":[]}`))
+	}))
+	defer tsProv1.Close()
+
+	tsProv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		key := strings.TrimPrefix(auth, "Bearer ")
+		mu.Lock()
+		callLog = append(callLog, "prov2:"+key)
+		mu.Unlock()
+
+		if key == "p2-fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":{"message":"prov2 failed"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"chatcmpl-prov2","choices":[]}`))
+	}))
+	defer tsProv2.Close()
+
+	bodyMod := func(rawBody []byte, route *SelectedRoute, r *http.Request) ([]byte, string, error) {
+		return rawBody, "application/json", nil
+	}
+
+	// Subtest 1: Prov1 returns 500 on its only key. It should fallback to Prov2 and succeed.
+	t.Run("FallbackOn500", func(t *testing.T) {
+		mu.Lock()
+		callLog = nil
+		mu.Unlock()
+
+		cfg := &Config{
+			Clients: ClientsConfig{
+				RateLimit: 100,
+				Auth: []ClientAuth{{Name: "c1", Key: "client-key"}},
+			},
+			Models: []ModelConfig{
+				{
+					Name: "m-500",
+					Providers: []ModelProviderConfig{
+						{Name: "p1", Upstream: tsProv1.URL, Model: "m1"},
+						{Name: "p2", Upstream: tsProv2.URL, Model: "m2"},
+					},
+				},
+			},
+			Providers: []ProviderConf{
+				{Name: "p1", AuthKeys: []string{"p1-500"}},
+				{Name: "p2", AuthKeys: []string{"p2-ok"}},
+			},
+		}
+
+		sm := NewStateManager()
+		router := NewRouter(cfg, sm)
+		proxyMgr := NewProxyManager()
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m-500"}`)))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("Content-Type", "application/json")
+
+		route, resp, _, _, ok := executeUpstreamRequest(plugins.EndpointChat, w, req, cfg, sm, router, proxyMgr, bodyMod)
+		if !ok {
+			t.Fatalf("expected ok=true")
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK after fallback, got %d", resp.StatusCode)
+		}
+		if route.ModelProvider.Name != "p2" || route.AuthKey != "p2-ok" {
+			t.Errorf("expected fallback to p2/p2-ok, got %s/%s", route.ModelProvider.Name, route.AuthKey)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(callLog) != 2 || callLog[0] != "prov1:p1-500" || callLog[1] != "prov2:p2-ok" {
+			t.Errorf("unexpected callLog: %v", callLog)
+		}
+	})
+
+	// Subtest 2: Prov1 returns 401, Prov2 returns 403, Prov3 returns 200.
+	t.Run("FallbackOn401And403", func(t *testing.T) {
+		mu.Lock()
+		callLog = nil
+		mu.Unlock()
+
+		tsProv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			auth := r.Header.Get("Authorization")
+			key := strings.TrimPrefix(auth, "Bearer ")
+			mu.Lock()
+			callLog = append(callLog, "prov3:"+key)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"chatcmpl-prov3"}`))
+		}))
+		defer tsProv3.Close()
+
+		cfg := &Config{
+			Clients: ClientsConfig{
+				RateLimit: 100,
+				Auth: []ClientAuth{{Name: "c1", Key: "client-key"}},
+			},
+			Models: []ModelConfig{
+				{
+					Name: "m-auth",
+					Providers: []ModelProviderConfig{
+						{Name: "p1", Upstream: tsProv1.URL, Model: "m1"},
+						{Name: "p2", Upstream: tsProv1.URL, Model: "m2"},
+						{Name: "p3", Upstream: tsProv3.URL, Model: "m3"},
+					},
+				},
+			},
+			Providers: []ProviderConf{
+				{Name: "p1", AuthKeys: []string{"p1-401"}},
+				{Name: "p2", AuthKeys: []string{"p1-403"}},
+				{Name: "p3", AuthKeys: []string{"p3-ok"}},
+			},
+		}
+
+		sm := NewStateManager()
+		router := NewRouter(cfg, sm)
+		proxyMgr := NewProxyManager()
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m-auth"}`)))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("Content-Type", "application/json")
+
+		route, resp, _, _, ok := executeUpstreamRequest(plugins.EndpointChat, w, req, cfg, sm, router, proxyMgr, bodyMod)
+		if !ok {
+			t.Fatalf("expected ok=true")
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK after fallback, got %d", resp.StatusCode)
+		}
+		if route.ModelProvider.Name != "p3" {
+			t.Errorf("expected fallback to p3, got %s", route.ModelProvider.Name)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(callLog) != 3 || callLog[0] != "prov1:p1-401" || callLog[1] != "prov1:p1-403" || callLog[2] != "prov3:p3-ok" {
+			t.Errorf("unexpected callLog: %v", callLog)
+		}
+	})
+
+	// Subtest 3: Network error on Prov1 (connection refused / closed port). Should fallback to Prov2.
+	t.Run("FallbackOnNetworkError", func(t *testing.T) {
+		mu.Lock()
+		callLog = nil
+		mu.Unlock()
+
+		cfg := &Config{
+			Clients: ClientsConfig{
+				RateLimit: 100,
+				Auth: []ClientAuth{{Name: "c1", Key: "client-key"}},
+			},
+			Models: []ModelConfig{
+				{
+					Name: "m-net",
+					Providers: []ModelProviderConfig{
+						{Name: "p1-dead", Upstream: "http://127.0.0.1:1", Model: "m1"}, // invalid / unreachable port
+						{Name: "p2", Upstream: tsProv2.URL, Model: "m2"},
+					},
+				},
+			},
+			Providers: []ProviderConf{
+				{Name: "p1-dead", AuthKeys: []string{"dead-key"}},
+				{Name: "p2", AuthKeys: []string{"p2-ok"}},
+			},
+		}
+
+		sm := NewStateManager()
+		router := NewRouter(cfg, sm)
+		proxyMgr := NewProxyManager()
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"m-net"}`)))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("Content-Type", "application/json")
+
+		route, resp, _, _, ok := executeUpstreamRequest(plugins.EndpointChat, w, req, cfg, sm, router, proxyMgr, bodyMod)
+		if !ok {
+			t.Fatalf("expected ok=true")
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK after network fallback, got %d", resp.StatusCode)
+		}
+		if route.ModelProvider.Name != "p2" || route.AuthKey != "p2-ok" {
+			t.Errorf("expected fallback to p2, got %s / %s", route.ModelProvider.Name, route.AuthKey)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(callLog) != 1 || callLog[0] != "prov2:p2-ok" {
+			t.Errorf("unexpected callLog: %v", callLog)
+		}
+	})
+}
+
 
 

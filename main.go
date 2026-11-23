@@ -253,23 +253,29 @@ func executeUpstreamRequest(
 		modelName:     modelName,
 	}
 
-	// 5-9. Select route, build request, execute with retry on 429/500/503
+	// 5-9. Select route, build request, execute with retry on 429/500/503/401/403 and network errors
 	const maxRetries = 4
 	var route *SelectedRoute
 	var resp *http.Response
 	var lastFailedResp *http.Response
 	var lastFailedRoute *SelectedRoute
+	var lastNetErr error
+	attemptedKeys := make(map[string]bool)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// 5. Select Route (Model/Provider/AuthKey)
 		var err error
-		route, err = router.SelectRoute(modelName)
+		route, err = router.SelectRoute(modelName, attemptedKeys)
 		if err != nil {
 			if lastFailedResp != nil {
 				// Retry failed because no more keys are available; fallback to last failed upstream response
 				route = lastFailedRoute
 				resp = lastFailedResp
 				break
+			}
+			if lastNetErr != nil {
+				http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, lastNetErr.Error()), http.StatusBadGateway)
+				return nil, nil, hCtx, startTime, false
 			}
 			fmt.Printf("[ERROR] Routing failed for model %q: %v\n", modelName, err)
 			http.Error(w, fmt.Sprintf(`{"error": {"message": %q, "type": "rate_limit_error"}}`, err.Error()), http.StatusTooManyRequests)
@@ -338,6 +344,16 @@ func executeUpstreamRequest(
 			elapsed := time.Since(startTime)
 			fmt.Printf("[ERROR] Model=%s Provider=%s Key[%d] 502 %s Error: %v\n",
 				modelName, route.ModelProvider.Name, route.KeyIndex, elapsed, err)
+			attemptedKeys[route.AuthKey] = true
+			lastNetErr = err
+			lastFailedRoute = route
+			if attempt < maxRetries {
+				router.AdvanceKey(modelName, route.ModelProvider.Name)
+				fmt.Printf("[WARN] Upstream request to provider %q (key[%d]) failed: %v, retrying (attempt %d/%d)\n",
+					route.ModelProvider.Name, route.KeyIndex, err, attempt+1, maxRetries)
+				startTime = time.Now()
+				continue
+			}
 			http.Error(w, fmt.Sprintf(`{"error": {"message": "Upstream request failed: %s"}}`, err.Error()), http.StatusBadGateway)
 			return nil, nil, hCtx, startTime, false
 		}
@@ -346,7 +362,9 @@ func executeUpstreamRequest(
 		stateMgr.RecordUpstreamResult(route.AuthKey, resp.StatusCode)
 
 		// Check if retry is needed for retryable status codes
-		if (resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503) && attempt < maxRetries {
+		isRetryable := resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 503 || resp.StatusCode == 401 || resp.StatusCode == 403
+		if isRetryable && attempt < maxRetries {
+			attemptedKeys[route.AuthKey] = true
 			router.AdvanceKey(modelName, route.ModelProvider.Name)
 
 			bodyBytes, _ := io.ReadAll(resp.Body)
@@ -359,8 +377,8 @@ func executeUpstreamRequest(
 			lastFailedResp = resp
 			lastFailedRoute = route
 
-			fmt.Printf("[WARN] Upstream (key[%d]) returned %d, retrying with next key (attempt %d/%d)\n",
-				route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
+			fmt.Printf("[WARN] Upstream provider %q (key[%d]) returned %d, retrying with next available key/provider (attempt %d/%d)\n",
+				route.ModelProvider.Name, route.KeyIndex, resp.StatusCode, attempt+1, maxRetries)
 			startTime = time.Now()
 			continue
 		}
