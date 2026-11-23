@@ -406,8 +406,22 @@ func CleanGeminiSchema(schema interface{}) interface{} {
 		}
 	}
 
+	// 2. Handle "examples": OpenAPI 3.0 / Gemini Schema does not support "examples" (plural), only "example" (singular).
+	// If "example" is not present, extract the first element of "examples" (if non-empty array) or the value itself.
+	if examplesVal, ok := m["examples"]; ok {
+		if _, hasExample := m["example"]; !hasExample {
+			if examplesArr, ok := examplesVal.([]interface{}); ok {
+				if len(examplesArr) > 0 {
+					cleaned["example"] = examplesArr[0]
+				}
+			} else if examplesVal != nil {
+				cleaned["example"] = examplesVal
+			}
+		}
+	}
+
 	for k, v := range m {
-		if k == "$schema" || k == "$id" || k == "$vocabulary" || k == "$anchor" || k == "additionalProperties" || k == "exclusiveMinimum" || k == "exclusiveMaximum" || k == "const" {
+		if k == "$schema" || k == "$id" || k == "$vocabulary" || k == "$anchor" || k == "$comment" || k == "additionalProperties" || k == "exclusiveMinimum" || k == "exclusiveMaximum" || k == "const" || k == "examples" {
 			continue
 		}
 
@@ -923,6 +937,34 @@ func TransformRequestToGemini(rawBody []byte, r *http.Request, ctx *Context) ([]
 							decl["parameters"] = cleanGeminiSchema(params)
 						}
 						functionDeclarations = append(functionDeclarations, decl)
+					}
+				} else if fds, ok := tMap["functionDeclarations"].([]interface{}); ok {
+					for _, fd := range fds {
+						if fdMap, ok := fd.(map[string]interface{}); ok {
+							decl := make(map[string]interface{})
+							for fdk, fdv := range fdMap {
+								if fdk == "parameters" {
+									decl[fdk] = cleanGeminiSchema(fdv)
+								} else {
+									decl[fdk] = fdv
+								}
+							}
+							functionDeclarations = append(functionDeclarations, decl)
+						}
+					}
+				} else if fds, ok := tMap["function_declarations"].([]interface{}); ok {
+					for _, fd := range fds {
+						if fdMap, ok := fd.(map[string]interface{}); ok {
+							decl := make(map[string]interface{})
+							for fdk, fdv := range fdMap {
+								if fdk == "parameters" {
+									decl[fdk] = cleanGeminiSchema(fdv)
+								} else {
+									decl[fdk] = fdv
+								}
+							}
+							functionDeclarations = append(functionDeclarations, decl)
+						}
 					}
 				}
 			}

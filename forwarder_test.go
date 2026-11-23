@@ -3205,6 +3205,27 @@ func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
 					map[string]interface{}{"type": "number"},
 				},
 			},
+			"withExamples": map[string]interface{}{
+				"type":     "string",
+				"examples": []interface{}{"ex1", "ex2"},
+			},
+			"withBothExample": map[string]interface{}{
+				"type":     "string",
+				"example":  "existing_ex",
+				"examples": []interface{}{"new_ex1", "new_ex2"},
+			},
+			"withEmptyExamples": map[string]interface{}{
+				"type":     "string",
+				"examples": []interface{}{},
+			},
+			"withScalarExample": map[string]interface{}{
+				"type":     "string",
+				"examples": "scalar_example",
+			},
+			"withComment": map[string]interface{}{
+				"type":     "string",
+				"$comment": "internal note",
+			},
 		},
 	}
 
@@ -3275,6 +3296,48 @@ func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
 		t.Errorf("Expected anyOf with 2 elements, got %v", unionField["anyOf"])
 	}
 
+	// Check "withExamples": examples: ["ex1", "ex2"] -> example: "ex1", no examples
+	withEx := props["withExamples"].(map[string]interface{})
+	if _, ok := withEx["examples"]; ok {
+		t.Errorf("Expected examples to be stripped from withExamples")
+	}
+	if withEx["example"] != "ex1" {
+		t.Errorf("Expected example 'ex1', got %v", withEx["example"])
+	}
+
+	// Check "withBothExample": existing example preserved, examples stripped
+	withBoth := props["withBothExample"].(map[string]interface{})
+	if _, ok := withBoth["examples"]; ok {
+		t.Errorf("Expected examples to be stripped from withBothExample")
+	}
+	if withBoth["example"] != "existing_ex" {
+		t.Errorf("Expected preserved example 'existing_ex', got %v", withBoth["example"])
+	}
+
+	// Check "withEmptyExamples": examples stripped, no example added
+	withEmpty := props["withEmptyExamples"].(map[string]interface{})
+	if _, ok := withEmpty["examples"]; ok {
+		t.Errorf("Expected examples to be stripped from withEmptyExamples")
+	}
+	if _, ok := withEmpty["example"]; ok {
+		t.Errorf("Expected no example field for withEmptyExamples")
+	}
+
+	// Check "withScalarExample": scalar example preserved as example
+	withScalar := props["withScalarExample"].(map[string]interface{})
+	if _, ok := withScalar["examples"]; ok {
+		t.Errorf("Expected examples to be stripped from withScalarExample")
+	}
+	if withScalar["example"] != "scalar_example" {
+		t.Errorf("Expected example 'scalar_example', got %v", withScalar["example"])
+	}
+
+	// Check "withComment": $comment stripped
+	withComment := props["withComment"].(map[string]interface{})
+	if _, ok := withComment["$comment"]; ok {
+		t.Errorf("Expected $comment to be stripped from withComment")
+	}
+
 	// B. Test real-world "create_skill" request with TransformRequestToGemini
 	route := &SelectedRoute{
 		ModelProvider: &ModelProviderConfig{
@@ -3329,7 +3392,8 @@ func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
 							},
 							"id": {
 								"type": "string",
-								"description": "Unique lowercase skill slug."
+								"description": "Unique lowercase skill slug.",
+								"examples": ["my-skill-slug"]
 							},
 							"name": {
 								"type": "string",
@@ -3355,7 +3419,8 @@ func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
 					"properties": {
 						"status": {
 							"const": "ok",
-							"type": "string"
+							"type": "string",
+							"examples": ["ok"]
 						}
 					}
 				}
@@ -3397,6 +3462,15 @@ func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
 		t.Errorf("Expected encoding.enum to be [\"base64\"], got %v", encodingProp["enum"])
 	}
 
+	// Verify id.examples -> id.example
+	idProp := createSkillParams["properties"].(map[string]interface{})["id"].(map[string]interface{})
+	if _, ok := idProp["examples"]; ok {
+		t.Errorf("Expected id.examples to be removed")
+	}
+	if idProp["example"] != "my-skill-slug" {
+		t.Errorf("Expected id.example 'my-skill-slug', got %v", idProp["example"])
+	}
+
 	// Verify response_format -> generationConfig.responseSchema
 	genConfig := geminiReq["generationConfig"].(map[string]interface{})
 	respSchema, ok := genConfig["responseSchema"].(map[string]interface{})
@@ -3413,6 +3487,138 @@ func TestCleanGeminiSchema_ConstAndUnsupportedFields(t *testing.T) {
 	statusEnum, ok := statusProp["enum"].([]interface{})
 	if !ok || len(statusEnum) != 1 || statusEnum[0] != "ok" {
 		t.Errorf("Expected status enum [\"ok\"], got %v", statusProp["enum"])
+	}
+	if _, ok := statusProp["examples"]; ok {
+		t.Errorf("Expected status.examples to be stripped from responseSchema")
+	}
+	if statusProp["example"] != "ok" {
+		t.Errorf("Expected status.example 'ok', got %v", statusProp["example"])
+	}
+}
+
+// 23. Test reproduction of user error: tools[0].function_declarations[10].parameters.properties[0].value with examples
+func TestGeminiTools_ExamplesConversion(t *testing.T) {
+	route := &SelectedRoute{
+		ModelProvider: &ModelProviderConfig{
+			Name:    "gemini-provider",
+			Model:   "gemini-2.5-flash",
+			ApiType: "gemini",
+		},
+	}
+
+	// Build 11 tool functions so index 10 has examples on properties[0]
+	var tools []map[string]interface{}
+	for i := 0; i < 11; i++ {
+		fnName := fmt.Sprintf("tool_func_%d", i)
+		propName := fmt.Sprintf("param_%d", i)
+		tools = append(tools, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        fnName,
+				"description": fmt.Sprintf("Description for %s", fnName),
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						propName: map[string]interface{}{
+							"type":        "string",
+							"description": "A parameter",
+							"examples":    []interface{}{fmt.Sprintf("sample_%d", i)},
+						},
+					},
+					"required": []interface{}{propName},
+				},
+			},
+		})
+	}
+
+	reqMap := map[string]interface{}{
+		"model":    "gemini-2.5-flash",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "Run tools"}},
+		"tools":    tools,
+	}
+
+	reqBytes, err := json.Marshal(reqMap)
+	if err != nil {
+		t.Fatalf("Failed to marshal request: %v", err)
+	}
+
+	transformed, err := plugins.TransformRequestToGemini(reqBytes, nil, buildPluginContext(route, nil, nil, nil))
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed: %v", err)
+	}
+
+	var geminiReq map[string]interface{}
+	if err := json.Unmarshal(transformed, &geminiReq); err != nil {
+		t.Fatalf("Failed to parse transformed request: %v", err)
+	}
+
+	toolsList, ok := geminiReq["tools"].([]interface{})
+	if !ok || len(toolsList) == 0 {
+		t.Fatalf("Expected tools in transformed request")
+	}
+
+	fnDecls, ok := toolsList[0].(map[string]interface{})["functionDeclarations"].([]interface{})
+	if !ok || len(fnDecls) != 11 {
+		t.Fatalf("Expected 11 functionDeclarations, got %d", len(fnDecls))
+	}
+
+	// Verify index 10 specifically (as in the error: tools[0].function_declarations[10].parameters.properties[0].value)
+	decl10 := fnDecls[10].(map[string]interface{})
+	if decl10["name"] != "tool_func_10" {
+		t.Errorf("Expected name 'tool_func_10', got %v", decl10["name"])
+	}
+	params10 := decl10["parameters"].(map[string]interface{})
+	props10 := params10["properties"].(map[string]interface{})
+	val10 := props10["param_10"].(map[string]interface{})
+
+	if _, ok := val10["examples"]; ok {
+		t.Errorf("Unknown name 'examples' was NOT stripped from tools[0].functionDeclarations[10].parameters.properties.param_10")
+	}
+	if val10["example"] != "sample_10" {
+		t.Errorf("Expected example 'sample_10', got %v", val10["example"])
+	}
+	if val10["type"] != "STRING" {
+		t.Errorf("Expected type 'STRING', got %v", val10["type"])
+	}
+
+	// Also verify Gemini native tools format
+	nativeToolsReq := map[string]interface{}{
+		"model":    "gemini-2.5-flash",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "Run native tools"}},
+		"tools": []interface{}{
+			map[string]interface{}{
+				"functionDeclarations": []interface{}{
+					map[string]interface{}{
+						"name": "native_func",
+						"parameters": map[string]interface{}{
+							"type": "OBJECT",
+							"properties": map[string]interface{}{
+								"arg": map[string]interface{}{
+									"type":     "STRING",
+									"examples": []interface{}{"native_example"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	nativeBytes, _ := json.Marshal(nativeToolsReq)
+	transformedNative, err := plugins.TransformRequestToGemini(nativeBytes, nil, buildPluginContext(route, nil, nil, nil))
+	if err != nil {
+		t.Fatalf("TransformRequestToGemini failed for native tools: %v", err)
+	}
+	var geminiNativeReq map[string]interface{}
+	_ = json.Unmarshal(transformedNative, &geminiNativeReq)
+	nativeToolsList := geminiNativeReq["tools"].([]interface{})
+	nativeDecls := nativeToolsList[0].(map[string]interface{})["functionDeclarations"].([]interface{})
+	nativeArg := nativeDecls[0].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})["arg"].(map[string]interface{})
+	if _, ok := nativeArg["examples"]; ok {
+		t.Errorf("Expected examples stripped from native tools declaration")
+	}
+	if nativeArg["example"] != "native_example" {
+		t.Errorf("Expected example 'native_example', got %v", nativeArg["example"])
 	}
 }
 
